@@ -103,6 +103,22 @@ if [[ "$SKIP_KERNEL" == "false" ]]; then
         ./scripts/config --enable CONFIG_HID_GENERIC
         ./scripts/config --enable CONFIG_INPUT_KEYBOARD
         ./scripts/config --enable CONFIG_INPUT_MOUSE
+        # I2C support for sensors
+        ./scripts/config --enable CONFIG_I2C
+        ./scripts/config --enable CONFIG_I2C_CHARDEV
+        ./scripts/config --enable CONFIG_I2C_BCM2835
+        ./scripts/config --enable CONFIG_I2C_BCM2708
+        # Enable bh1750 light sensor driver (as module)
+        ./scripts/config --enable CONFIG_BH1750
+        ./scripts/config --enable CONFIG_IIO
+        ./scripts/config --enable CONFIG_IIO_BUFFER
+        ./scripts/config --enable CONFIG_IIO_KFIFO_BUF
+        # CAN bus support for mcp2515
+        ./scripts/config --enable CONFIG_CAN
+        ./scripts/config --enable CONFIG_CAN_DEV
+        ./scripts/config --enable CONFIG_CAN_MCP251X
+        ./scripts/config --enable CONFIG_SPI
+        ./scripts/config --enable CONFIG_SPI_BCM2835
         
         make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
         make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image modules dtbs
@@ -119,7 +135,7 @@ if [[ "$SKIP_ROOTFS" == "false" ]]; then
         sudo rm -rf "$BUILD_DIR/rootfs"
         mkdir -p "$BUILD_DIR/rootfs"
         sudo debootstrap --arch=arm64 --variant=minbase \
-            --include=labwc,seatd,libseat1,busybox,kmod,udev,fish,systemd,dbus,libgl1-mesa-dri,mesa-vulkan-drivers,libwayland-client0,libwayland-server0,libegl1,libgles2,libicu76,iproute2,iputils-ping,nano,openssh-server,wget,gnupg \
+            --include=labwc,seatd,libseat1,busybox,kmod,udev,fish,systemd,dbus,libgl1-mesa-dri,mesa-vulkan-drivers,libwayland-client0,libwayland-server0,libegl1,libgles2,libicu76,iproute2,iputils-ping,nano,openssh-server,wget,gnupg,systemd-resolved,can-utils \
             trixie "$BUILD_DIR/rootfs" http://deb.debian.org/debian
     else
         echo "RootFS already exists, skipping debootstrap (delete rootfs dir to rebuild)"
@@ -219,6 +235,16 @@ vc4
 v3d
 EOF
 
+# Ensure i2c-dev module loads for I2C device access
+sudo tee "$ROOTFS/etc/modules-load.d/i2c.conf" > /dev/null << 'EOF'
+i2c-dev
+EOF
+
+# Auto-load bh1750 light sensor driver module
+sudo tee "$ROOTFS/etc/modules-load.d/bh1750.conf" > /dev/null << 'EOF'
+bh1750
+EOF
+
 # Blacklist Bluetooth and WiFi modules to prevent loading
 sudo mkdir -p "$ROOTFS/etc/modprobe.d"
 sudo tee "$ROOTFS/etc/modprobe.d/disable-wifi-bt.conf" > /dev/null << 'EOF'
@@ -255,6 +281,14 @@ sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable systemd-resolved" 2>/dev/nu
 sudo rm -f "$ROOTFS/etc/resolv.conf"
 sudo mkdir -p "$ROOTFS/run/systemd/resolve"
 sudo ln -s /run/systemd/resolve/stub-resolv.conf "$ROOTFS/etc/resolv.conf"
+
+# Create fallback static resolv.conf in case systemd-resolved isn't available
+# This ensures DNS works even if systemd-resolved fails to start
+sudo tee "$ROOTFS/etc/resolv.conf.fallback" > /dev/null << 'EOF'
+nameserver 8.8.8.8
+nameserver 8.8.4.4
+nameserver 1.1.1.1
+EOF
 
 # Enable seatd for Wayland seat management
 sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable seatd" 2>/dev/null || true
@@ -395,6 +429,13 @@ dtoverlay=vc4-kms-v3d-pi5
 # Disable Bluetooth and WiFi
 dtoverlay=disable-bt
 dtoverlay=disable-wifi
+
+# Enable I2C interface (matches raspi-config behavior)
+dtoverlay=i2c1
+
+# Enable SPI and MCP2515 CAN bus controller
+dtoverlay=spi
+dtoverlay=mcp2515-can0,oscillator=16000000,interrupt=25
 
 # Force HDMI hotplug (skip detection wait, but allow EDID for auto-resolution)
 hdmi_force_hotplug=1
