@@ -13,6 +13,7 @@ IMG_NAME="rpi5-fastboot.img"
 CONSOLE_ONLY=false
 SKIP_KERNEL=false
 SKIP_ROOTFS=false
+UI_SELECTION=""
 
 # Parse arguments
 for arg in "$@"; do
@@ -33,6 +34,21 @@ for arg in "$@"; do
             SKIP_KERNEL=true
             SKIP_ROOTFS=true
             echo "[OPT] Quick mode: skipping kernel and rootfs builds"
+            ;;
+        --ui)
+            # Get the next argument as UI selection
+            shift
+            UI_SELECTION="$1"
+            if [ -z "$UI_SELECTION" ]; then
+                echo "Error: --ui requires a UI system name (e.g., --ui realdash)"
+                exit 1
+            fi
+            echo "[OPT] UI system selected: $UI_SELECTION"
+            ;;
+        --ui=*)
+            # Handle --ui=realdash format
+            UI_SELECTION="${arg#*=}"
+            echo "[OPT] UI system selected: $UI_SELECTION"
             ;;
     esac
 done
@@ -403,6 +419,24 @@ fi
 exec labwc "$@"
 EOF
 sudo chmod +x "$ROOTFS/usr/local/bin/start-wayland"
+
+# Apply UI-specific customizations if a UI was selected
+if [ -n "$UI_SELECTION" ]; then
+    echo "=== 7z. Applying UI-specific Customizations: $UI_SELECTION ==="
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    UI_SCRIPT_DIR="$SCRIPT_DIR/${UI_SELECTION}_scripts"
+    UI_INSTALL_SCRIPT="$UI_SCRIPT_DIR/install.sh"
+    
+    if [ -d "$UI_SCRIPT_DIR" ] && [ -f "$UI_INSTALL_SCRIPT" ]; then
+        echo "Found UI installation script: $UI_INSTALL_SCRIPT"
+        # Source the install script, passing ROOTFS as environment variable
+        ROOTFS="$ROOTFS" bash "$UI_INSTALL_SCRIPT"
+        echo "UI customization completed"
+    else
+        echo "Warning: UI installation script not found at $UI_INSTALL_SCRIPT"
+        echo "Skipping UI-specific customizations"
+    fi
+fi
 
 echo "=== 8. Assembling Final Image ==="
 BOOT_DIR="$BUILD_DIR/boot_partition"
