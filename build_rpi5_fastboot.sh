@@ -13,7 +13,6 @@ IMG_NAME="rpi5-fastboot.img"
 CONSOLE_ONLY=false
 SKIP_KERNEL=false
 SKIP_ROOTFS=false
-UI_SELECTION=""
 
 # Parse arguments
 for arg in "$@"; do
@@ -34,21 +33,6 @@ for arg in "$@"; do
             SKIP_KERNEL=true
             SKIP_ROOTFS=true
             echo "[OPT] Quick mode: skipping kernel and rootfs builds"
-            ;;
-        --ui)
-            # Get the next argument as UI selection
-            shift
-            UI_SELECTION="$1"
-            if [ -z "$UI_SELECTION" ]; then
-                echo "Error: --ui requires a UI system name (e.g., --ui realdash)"
-                exit 1
-            fi
-            echo "[OPT] UI system selected: $UI_SELECTION"
-            ;;
-        --ui=*)
-            # Handle --ui=realdash format
-            UI_SELECTION="${arg#*=}"
-            echo "[OPT] UI system selected: $UI_SELECTION"
             ;;
     esac
 done
@@ -310,6 +294,8 @@ EOF
 sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable seatd" 2>/dev/null || true
 # Enable systemd-networkd for ethernet networking
 sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable systemd-networkd" 2>/dev/null || true
+# Disable systemd-networkd-wait-online to avoid boot delay
+sudo chroot "$ROOTFS" /bin/bash -c "systemctl disable systemd-networkd-wait-online.service" 2>/dev/null || true
 # Disable SSH from auto-starting (installed but not enabled)
 sudo chroot "$ROOTFS" /bin/bash -c "systemctl disable ssh" 2>/dev/null || true
 sudo chroot "$ROOTFS" /bin/bash -c "systemctl disable ssh.service" 2>/dev/null || true
@@ -342,25 +328,11 @@ ExecStart=-/sbin/agetty --autologin root --noclear %I $TERM
 Type=idle
 EOF
 
-# Fish config for auto-start labwc/Wayland (only if not console-only mode)
+# Fish config - Wayland auto-start removed (start manually if needed)
 sudo mkdir -p "$ROOTFS/root/.config/fish"
 sudo mkdir -p "$ROOTFS/root/.config/labwc"
 
-if [[ "$CONSOLE_ONLY" == "false" ]]; then
-    sudo tee "$ROOTFS/root/.config/fish/config.fish" > /dev/null << 'EOF'
-# Clear any inherited environment variables from build
-set -e DISPLAY
-set -e WAYLAND_DISPLAY
-
-if test (tty) = "/dev/tty1"
-    # Start labwc (Wayland compositor)
-    set -x XDG_RUNTIME_DIR /run/user/0
-    exec labwc
-end
-EOF
-else
-    sudo tee "$ROOTFS/root/.config/fish/config.fish" > /dev/null << 'EOF'
-# Console-only mode: Wayland auto-start disabled for debugging
+sudo tee "$ROOTFS/root/.config/fish/config.fish" > /dev/null << 'EOF'
 # Clear any inherited environment variables from build
 set -e DISPLAY
 set -e WAYLAND_DISPLAY
@@ -371,7 +343,6 @@ function sw
     labwc
 end
 EOF
-fi
 
 # Create a clean .profile that unsets inherited variables
 sudo tee "$ROOTFS/root/.profile" > /dev/null << 'EOF'
@@ -419,24 +390,6 @@ fi
 exec labwc "$@"
 EOF
 sudo chmod +x "$ROOTFS/usr/local/bin/start-wayland"
-
-# Apply UI-specific customizations if a UI was selected
-if [ -n "$UI_SELECTION" ]; then
-    echo "=== 7z. Applying UI-specific Customizations: $UI_SELECTION ==="
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    UI_SCRIPT_DIR="$SCRIPT_DIR/${UI_SELECTION}_scripts"
-    UI_INSTALL_SCRIPT="$UI_SCRIPT_DIR/install.sh"
-    
-    if [ -d "$UI_SCRIPT_DIR" ] && [ -f "$UI_INSTALL_SCRIPT" ]; then
-        echo "Found UI installation script: $UI_INSTALL_SCRIPT"
-        # Source the install script, passing ROOTFS as environment variable
-        ROOTFS="$ROOTFS" bash "$UI_INSTALL_SCRIPT"
-        echo "UI customization completed"
-    else
-        echo "Warning: UI installation script not found at $UI_INSTALL_SCRIPT"
-        echo "Skipping UI-specific customizations"
-    fi
-fi
 
 echo "=== 8. Assembling Final Image ==="
 BOOT_DIR="$BUILD_DIR/boot_partition"
