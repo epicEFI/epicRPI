@@ -6,6 +6,7 @@
 set -e
 
 # Configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="$HOME/rpi5-fastboot"
 SOURCES_DIR="$BUILD_DIR/sources"
 WINDOWS_WORKSPACE="/mnt/c/rpi-fastboot"
@@ -13,6 +14,7 @@ IMG_NAME="rpi5-fastboot.img"
 CONSOLE_ONLY=false
 SKIP_KERNEL=false
 SKIP_ROOTFS=false
+REALDASH_DEB="$SCRIPT_DIR/realdash-mrd_2.6.2-1_arm64.deb"
 
 # Parse arguments
 for arg in "$@"; do
@@ -135,7 +137,7 @@ if [[ "$SKIP_ROOTFS" == "false" ]]; then
         sudo rm -rf "$BUILD_DIR/rootfs"
         mkdir -p "$BUILD_DIR/rootfs"
         sudo debootstrap --arch=arm64 --variant=minbase \
-            --include=labwc,seatd,libseat1,busybox,kmod,udev,fish,systemd,dbus,libgl1-mesa-dri,mesa-vulkan-drivers,libwayland-client0,libwayland-server0,libegl1,libgles2,libicu76,iproute2,iputils-ping,nano,openssh-server,wget,gnupg,systemd-resolved,can-utils \
+            --include=labwc,seatd,libseat1,busybox,kmod,udev,fish,systemd,dbus,libgl1-mesa-dri,mesa-vulkan-drivers,libwayland-client0,libwayland-server0,libegl1,libgles2,libicu76,iproute2,iputils-ping,nano,openssh-server,wget,gnupg,systemd-resolved,can-utils,xserver-xorg-core,xserver-xorg,xinit,xauth,xserver-xorg-input-libinput,x11-xserver-utils,x11-utils \
             trixie "$BUILD_DIR/rootfs" http://deb.debian.org/debian
     else
         echo "RootFS already exists, skipping debootstrap (delete rootfs dir to rebuild)"
@@ -156,7 +158,9 @@ ROOTFS="$BUILD_DIR/rootfs"
 sudo mkdir -p "$ROOTFS/etc/apt/sources.list.d"
 sudo mkdir -p "$ROOTFS/usr/share/keyrings"
 # Download GPG key
-sudo wget -q -O - https://archive.raspberrypi.org/debian/raspberrypi.gpg.key | sudo gpg --dearmor -o "$ROOTFS/usr/share/keyrings/raspberrypi-archive-keyring.gpg"
+# Make this non-interactive: always overwrite existing keyring file.
+sudo rm -f "$ROOTFS/usr/share/keyrings/raspberrypi-archive-keyring.gpg"
+sudo wget -q -O - https://archive.raspberrypi.org/debian/raspberrypi.gpg.key | sudo gpg --batch --yes --dearmor -o "$ROOTFS/usr/share/keyrings/raspberrypi-archive-keyring.gpg"
 
 # Configure main Debian sources with all components (main, contrib, non-free, non-free-firmware)
 # Note: "universe multiverse restricted" are Ubuntu terms; Debian uses "main contrib non-free"
@@ -175,6 +179,30 @@ EOF
 echo "=== 7a. Installing Raspberry Pi Foundation Packages ==="
 sudo chroot "$ROOTFS" /bin/bash -c "apt-get update" 2>&1
 sudo chroot "$ROOTFS" /bin/bash -c "apt-get install -y rpi-eeprom raspi-config" 2>&1 || echo "Warning: Could not install rpi-eeprom/raspi-config (may need manual install after boot)"
+
+# Ensure Xorg launcher pieces exist (some repos/images end up without /usr/bin/xinit even if Xorg is present)
+sudo chroot "$ROOTFS" /bin/bash -c "apt-get install -y xinit x11-xserver-utils" 2>&1 || echo "Warning: Could not install xinit/x11-xserver-utils (may need manual install after boot)"
+
+# Disable automatic EEPROM update checks at boot (saves boot time; update manually when desired)
+sudo tee "$ROOTFS/etc/default/rpi-eeprom-update" > /dev/null << 'EOF'
+# Disable auto-updates at boot; update manually when desired:
+#   sudo rpi-eeprom-update -a
+RPI_EEPROM_UPDATE=0
+EOF
+sudo chroot "$ROOTFS" /bin/bash -c "systemctl disable rpi-eeprom-update.service rpi-eeprom-update.timer 2>/dev/null || true"
+sudo chroot "$ROOTFS" /bin/bash -c "systemctl mask rpi-eeprom-update.service 2>/dev/null || true"
+
+# Install RealDash .deb into the image (if present)
+echo "=== 7a.1 Installing RealDash (local .deb) ==="
+if [[ -f "$REALDASH_DEB" ]]; then
+    sudo mkdir -p "$ROOTFS/tmp"
+    sudo cp "$REALDASH_DEB" "$ROOTFS/tmp/"
+    # dpkg first, then fix dependencies via apt if needed
+    sudo chroot "$ROOTFS" /bin/bash -c "dpkg -i /tmp/$(basename "$REALDASH_DEB") || apt-get -y -f install"
+    sudo rm -f "$ROOTFS/tmp/$(basename "$REALDASH_DEB")"
+else
+    echo "Warning: RealDash .deb not found at $REALDASH_DEB (skipping install)"
+fi
 
 # Configure EEPROM boot order to prioritize USB (0xf14 = USB, then SD, then network)
 # This improves boot times by scanning USB first
@@ -205,8 +233,8 @@ sudo mkdir -p "$ROOTFS/etc/systemd/system"
 sudo tee "$ROOTFS/etc/systemd/system/apply-eeprom-config.service" > /dev/null << 'EOF'
 [Unit]
 Description=Apply EEPROM Boot Order Configuration
-After=network-online.target
-Wants=network-online.target
+ConditionPathExists=!/var/lib/rpi-eeprom-config-applied
+After=local-fs.target
 
 [Service]
 Type=oneshot
@@ -274,7 +302,10 @@ sudo tee "$ROOTFS/etc/systemd/resolved.conf" > /dev/null << 'EOF'
 DNS=8.8.8.8 8.8.4.4 1.1.1.1
 FallbackDNS=8.8.8.8 8.8.4.4
 EOF
-sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable systemd-resolved" 2>/dev/null || true
+# Don't enable systemd-resolved at boot; we'll start it after RealDash for fastest splash-to-dash.
+sudo chroot "$ROOTFS" /bin/bash -c "systemctl disable systemd-resolved.service 2>/dev/null || true"
+# If this image rootfs was reused, remove any old drop-ins that create ordering cycles.
+sudo rm -f "$ROOTFS/etc/systemd/system/systemd-resolved.service.d/after-realdash.conf" 2>/dev/null || true
 
 # Create symlink for systemd-resolved to work properly
 # Remove any existing resolv.conf and create symlink to systemd-resolved stub
@@ -292,13 +323,16 @@ EOF
 
 # Enable seatd for Wayland seat management
 sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable seatd" 2>/dev/null || true
-# Enable systemd-networkd for ethernet networking
-sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable systemd-networkd" 2>/dev/null || true
+# Don't enable systemd-networkd at boot; we'll start it after RealDash for fastest splash-to-dash.
+sudo chroot "$ROOTFS" /bin/bash -c "systemctl disable systemd-networkd.service 2>/dev/null || true"
+# If this image rootfs was reused, remove any old drop-ins that create ordering cycles.
+sudo rm -f "$ROOTFS/etc/systemd/system/systemd-networkd.service.d/after-realdash.conf" 2>/dev/null || true
 # Disable systemd-networkd-wait-online to avoid boot delay
 sudo chroot "$ROOTFS" /bin/bash -c "systemctl disable systemd-networkd-wait-online.service" 2>/dev/null || true
 # Disable SSH from auto-starting (installed but not enabled)
 sudo chroot "$ROOTFS" /bin/bash -c "systemctl disable ssh" 2>/dev/null || true
 sudo chroot "$ROOTFS" /bin/bash -c "systemctl disable ssh.service" 2>/dev/null || true
+sudo rm -f "$ROOTFS/etc/systemd/system/ssh.service.d/after-realdash.conf" 2>/dev/null || true
 # Add root to seat group for direct access
 sudo chroot "$ROOTFS" /bin/bash -c "usermod -a -G video,render,input root" 2>/dev/null || true
 
@@ -319,14 +353,16 @@ if ! grep -q "PermitRootLogin" "$ROOTFS/etc/ssh/sshd_config"; then
     echo "PermitRootLogin yes" | sudo tee -a "$ROOTFS/etc/ssh/sshd_config" > /dev/null
 fi
 
-# Auto-login on tty1
-sudo mkdir -p "$ROOTFS/etc/systemd/system/getty@tty1.service.d/"
-sudo tee "$ROOTFS/etc/systemd/system/getty@tty1.service.d/override.conf" > /dev/null << 'EOF'
+# Auto-login on tty1 (only if console-only mode, otherwise RealDash service handles tty1)
+if [[ "$CONSOLE_ONLY" == "true" ]]; then
+    sudo mkdir -p "$ROOTFS/etc/systemd/system/getty@tty1.service.d/"
+    sudo tee "$ROOTFS/etc/systemd/system/getty@tty1.service.d/override.conf" > /dev/null << 'EOF'
 [Service]
 ExecStart=
 ExecStart=-/sbin/agetty --autologin root --noclear %I $TERM
 Type=idle
 EOF
+fi
 
 # Fish config - Wayland auto-start removed (start manually if needed)
 sudo mkdir -p "$ROOTFS/root/.config/fish"
@@ -390,6 +426,153 @@ fi
 exec labwc "$@"
 EOF
 sudo chmod +x "$ROOTFS/usr/local/bin/start-wayland"
+
+# Configure Xorg for RealDash (if not console-only mode)
+if [[ "$CONSOLE_ONLY" == "false" ]]; then
+    echo "=== 7c. Configuring Xorg for RealDash ==="
+    
+    # Create Xorg configuration for Pi5 DRM/KMS
+    # Pi5 typically has: card0=v3d (3D), card1=vc4 (display). However, Xorg sometimes
+    # picks the wrong "primary" GPU at boot and exits with "no screens found".
+    # To make this robust, generate a tiny Xorg snippet at boot that selects the DRM
+    # card that actually has a connected HDMI connector.
+    sudo mkdir -p "$ROOTFS/etc/X11/xorg.conf.d"
+
+    # Script that selects kmsdev based on connected HDMI
+    sudo mkdir -p "$ROOTFS/usr/local/bin"
+    sudo tee "$ROOTFS/usr/local/bin/select-kmsdev" > /dev/null << 'EOF'
+#!/bin/sh
+set -eu
+
+OUT="/etc/X11/xorg.conf.d/99-kmsdev.conf"
+
+# Prefer a DRM card that has a connected HDMI connector.
+pick_card=""
+for s in /sys/class/drm/card*-HDMI-A-*/status; do
+  [ -e "$s" ] || continue
+  if [ "$(cat "$s" 2>/dev/null || echo "")" = "connected" ]; then
+    # e.g. /sys/class/drm/card1-HDMI-A-1/status -> card1
+    base="$(basename "$(dirname "$s")")"
+    pick_card="${base%%-*}"
+    break
+  fi
+done
+
+# Fallback: Pi 5 commonly uses card1 for the display controller.
+if [ -z "$pick_card" ]; then
+  pick_card="card1"
+fi
+
+cat > "$OUT" <<INNER
+Section "Device"
+  Identifier "RPiKMS"
+  Driver "modesetting"
+  Option "kmsdev" "/dev/dri/${pick_card}"
+  Option "PrimaryGPU" "true"
+EndSection
+INNER
+EOF
+    sudo chmod +x "$ROOTFS/usr/local/bin/select-kmsdev"
+
+    # systemd unit to generate the snippet before starting RealDash
+    sudo tee "$ROOTFS/etc/systemd/system/realdash-kmsdev.service" > /dev/null << 'EOF'
+[Unit]
+Description=Select DRM kmsdev for Xorg (before RealDash)
+DefaultDependencies=no
+After=systemd-udev-settle.service
+Before=realdash.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/select-kmsdev
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable realdash-kmsdev.service" 2>/dev/null || true
+    
+    # Create .xinitrc for RealDash
+    sudo tee "$ROOTFS/root/.xinitrc" > /dev/null << 'EOF'
+#!/bin/sh
+if command -v xset >/dev/null 2>&1; then
+  xset -dpms
+  xset s off
+  xset s noblank
+fi
+
+exec /usr/bin/realdash
+EOF
+    sudo chmod +x "$ROOTFS/root/.xinitrc"
+    
+    # Create systemd service to auto-start RealDash on boot
+    # Use /bin/sh -c to let shell find xinit via PATH (more robust than hardcoding /usr/bin/xinit)
+    sudo tee "$ROOTFS/etc/systemd/system/realdash.service" > /dev/null << 'EOF'
+[Unit]
+Description=RealDash (Xorg on tty1)
+After=systemd-user-sessions.service
+After=seatd.service
+Wants=seatd.service
+Conflicts=getty@tty1.service
+
+[Service]
+User=root
+WorkingDirectory=/root
+Environment=HOME=/root
+Environment=DISPLAY=:0
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+ExecStart=/bin/sh -c "xinit /root/.xinitrc -- :0 -nolisten tcp -keeptty vt1"
+Restart=always
+RestartSec=0.5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    
+    # Enable RealDash service (but don't enable if console-only)
+    sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable realdash.service" 2>/dev/null || true
+    
+    # Configure services to start AFTER RealDash (deferred startup for faster boot)
+    echo "=== 7d. Configuring deferred service startup (after RealDash) ==="
+    
+    # Create post-realdash service to batch-start non-critical services
+    sudo tee "$ROOTFS/etc/systemd/system/post-realdash.service" > /dev/null << 'EOF'
+[Unit]
+Description=Start non-critical services after RealDash
+After=realdash.service
+Wants=realdash.service
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+# Start these services after RealDash is running
+ExecStart=/bin/sh -c 'systemctl start systemd-networkd systemd-resolved ssh 2>/dev/null || true'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable post-realdash.service" 2>/dev/null || true
+    
+    # NOTE: We intentionally do NOT add "After=realdash.service" drop-ins to system units like
+    # systemd-networkd/systemd-resolved. That can create ordering cycles during early boot.
+    # Instead, we simply start them from post-realdash.service.
+    
+    # Configure journald for volatile storage (faster boot, no flush delay)
+    sudo mkdir -p "$ROOTFS/etc/systemd/journald.conf.d"
+    sudo tee "$ROOTFS/etc/systemd/journald.conf.d/fastboot.conf" > /dev/null << 'EOF'
+[Journal]
+Storage=volatile
+EOF
+    echo "✓ Services configured to start after RealDash"
+else
+    echo "Skipping Xorg/RealDash setup (console-only mode)"
+fi
 
 echo "=== 8. Assembling Final Image ==="
 BOOT_DIR="$BUILD_DIR/boot_partition"
