@@ -18,6 +18,8 @@ The images are built from kernel up for specific hardware. It is imperative that
 
 [BH1750 light sensor](https://a.co/d/2t3qrWY)
 
+MIPI-DSI or HDMI display fitting your application
+
 ## install
 
 ### precompiled image
@@ -46,4 +48,14 @@ for console only image run:
 
 ```
 
-not to be confused with pidash
+to configure auto brightess, hit ctrl-F2 to enter TTY2 console on your connected display
+
+U: root
+
+PW: raspberry
+
+```bash
+
+auto-brightness setup
+
+```
