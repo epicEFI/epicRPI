@@ -1,7 +1,7 @@
 #!/bin/bash
 # RPi5 Fast Boot Master Build Script
 # This script automates the entire process from a fresh WSL environment.
-# Usage: ./build_rpi5_fastboot.sh [--console-only] [--skip-kernel] [--skip-rootfs] [--quick]
+# Usage: ./build_rpi5_fastboot.sh [--console-only] [--skip-kernel] [--skip-rootfs] [--quick] [--can-oscillator=FREQ]
 
 set -e
 
@@ -15,6 +15,7 @@ CONSOLE_ONLY=false
 SKIP_KERNEL=false
 SKIP_ROOTFS=false
 REALDASH_DEB="$SCRIPT_DIR/realdash-mrd_2.6.2-1_arm64.deb"
+CAN_OSCILLATOR_FREQ=12000000  # Default to 12 MHz
 
 # Parse arguments
 for arg in "$@"; do
@@ -36,8 +37,18 @@ for arg in "$@"; do
             SKIP_ROOTFS=true
             echo "[OPT] Quick mode: skipping kernel and rootfs builds"
             ;;
+        --can-oscillator=*)
+            CAN_OSCILLATOR_FREQ="${arg#*=}"
+            echo "[OPT] CAN bus oscillator frequency set to ${CAN_OSCILLATOR_FREQ} Hz"
+            ;;
+        --can-oscillator)
+            echo "Error: --can-oscillator requires a value (e.g., --can-oscillator=12000000)"
+            exit 1
+            ;;
     esac
 done
+
+echo "[CONFIG] CAN bus oscillator frequency: ${CAN_OSCILLATOR_FREQ} Hz (default: 12 MHz)"
 
 echo "=== 1. Installing System Dependencies ==="
 sudo apt-get update
@@ -137,7 +148,7 @@ if [[ "$SKIP_ROOTFS" == "false" ]]; then
         sudo rm -rf "$BUILD_DIR/rootfs"
         mkdir -p "$BUILD_DIR/rootfs"
         sudo debootstrap --arch=arm64 --variant=minbase \
-            --include=labwc,seatd,libseat1,busybox,kmod,udev,fish,systemd,dbus,libgl1-mesa-dri,mesa-vulkan-drivers,libwayland-client0,libwayland-server0,libegl1,libgles2,libicu76,iproute2,iputils-ping,nano,openssh-server,wget,gnupg,systemd-resolved,can-utils,xserver-xorg-core,xserver-xorg,xinit,xauth,xserver-xorg-input-libinput,x11-xserver-utils,x11-utils \
+            --include=labwc,seatd,libseat1,busybox,kmod,udev,fish,systemd,dbus,libgl1-mesa-dri,mesa-vulkan-drivers,libwayland-client0,libwayland-server0,libegl1,libgles2,libicu76,iproute2,iputils-ping,nano,openssh-server,wget,gnupg,systemd-resolved,can-utils,xserver-xorg-core,xserver-xorg,xinit,xauth,xserver-xorg-input-libinput,x11-xserver-utils,x11-utils,cloud-guest-utils,e2fsprogs,picom \
             trixie "$BUILD_DIR/rootfs" http://deb.debian.org/debian
     else
         echo "RootFS already exists, skipping debootstrap (delete rootfs dir to rebuild)"
@@ -182,6 +193,10 @@ sudo chroot "$ROOTFS" /bin/bash -c "apt-get install -y rpi-eeprom raspi-config" 
 
 # Ensure Xorg launcher pieces exist (some repos/images end up without /usr/bin/xinit even if Xorg is present)
 sudo chroot "$ROOTFS" /bin/bash -c "apt-get install -y xinit x11-xserver-utils" 2>&1 || echo "Warning: Could not install xinit/x11-xserver-utils (may need manual install after boot)"
+
+# Ensure filesystem expansion tools are installed (critical for first boot)
+echo "=== 7a.2 Installing Filesystem Expansion Tools ==="
+sudo chroot "$ROOTFS" /bin/bash -c "apt-get install -y cloud-guest-utils e2fsprogs" 2>&1 || echo "Warning: Could not install cloud-guest-utils/e2fsprogs (filesystem expansion may fail)"
 
 # Disable automatic EEPROM update checks at boot (saves boot time; update manually when desired)
 sudo tee "$ROOTFS/etc/default/rpi-eeprom-update" > /dev/null << 'EOF'
@@ -245,6 +260,91 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
 sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable apply-eeprom-config.service" 2>/dev/null || true
+
+# Configure filesystem expansion on first boot
+echo "=== 7b.1. Configuring Filesystem Expansion ==="
+sudo tee "$ROOTFS/usr/local/bin/expand-filesystem" > /dev/null << 'EOF'
+#!/bin/bash
+# Expand root filesystem to fill available space on first boot
+set -e  # Exit on error for better debugging
+
+if [ ! -f /var/lib/filesystem-expanded ]; then
+    # Find the root device (usually /dev/sda2 or /dev/mmcblk0p2)
+    ROOT_DEV=$(findmnt -n -o SOURCE /)
+    if [ -z "$ROOT_DEV" ]; then
+        ROOT_DEV=$(df -h / | tail -1 | awk '{print $1}')
+    fi
+    
+    echo "Expanding filesystem on $ROOT_DEV" >&2
+    
+    # Extract device and partition number (e.g., /dev/sda2 -> sda 2)
+    if [[ "$ROOT_DEV" =~ /dev/([a-z]+)([0-9]+) ]]; then
+        DISK_DEV="/dev/${BASH_REMATCH[1]}"
+        PART_NUM="${BASH_REMATCH[2]}"
+        
+        echo "Disk: $DISK_DEV, Partition: $PART_NUM" >&2
+        
+        # Resize partition using growpart (preferred) or parted (fallback)
+        if command -v growpart >/dev/null 2>&1; then
+            echo "Using growpart to resize partition..." >&2
+            growpart "$DISK_DEV" "$PART_NUM" || {
+                echo "ERROR: growpart failed" >&2
+                exit 1
+            }
+        elif command -v parted >/dev/null 2>&1; then
+            echo "Using parted to resize partition..." >&2
+            parted "$DISK_DEV" resizepart "$PART_NUM" 100% || {
+                echo "ERROR: parted resizepart failed" >&2
+                exit 1
+            }
+        else
+            echo "ERROR: Neither growpart nor parted found. Install cloud-guest-utils or parted." >&2
+            exit 1
+        fi
+        
+        # Resize filesystem
+        if command -v resize2fs >/dev/null 2>&1; then
+            echo "Resizing filesystem..." >&2
+            resize2fs "$ROOT_DEV" || {
+                echo "ERROR: resize2fs failed" >&2
+                exit 1
+            }
+        else
+            echo "ERROR: resize2fs not found. Install e2fsprogs." >&2
+            exit 1
+        fi
+        
+        # Mark as expanded
+        touch /var/lib/filesystem-expanded
+        echo "Filesystem expansion complete!" >&2
+    else
+        echo "ERROR: Could not parse root device: $ROOT_DEV" >&2
+        exit 1
+    fi
+else
+    echo "Filesystem already expanded, skipping." >&2
+fi
+EOF
+sudo chmod +x "$ROOTFS/usr/local/bin/expand-filesystem"
+
+# Create systemd service to run on first boot
+sudo tee "$ROOTFS/etc/systemd/system/expand-filesystem.service" > /dev/null << 'EOF'
+[Unit]
+Description=Expand Root Filesystem
+ConditionPathExists=!/var/lib/filesystem-expanded
+After=systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/expand-filesystem
+StandardOutput=journal
+StandardError=journal
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable expand-filesystem.service" 2>/dev/null || true
 
 # Set proper hostname (not inherited from WSL)
 echo "rpi5" | sudo tee "$ROOTFS/etc/hostname" > /dev/null
@@ -491,13 +591,44 @@ WantedBy=multi-user.target
 EOF
     sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable realdash-kmsdev.service" 2>/dev/null || true
     
+    # Configure Xorg input devices for mouse cursor
+    sudo tee "$ROOTFS/etc/X11/xorg.conf.d/40-libinput.conf" > /dev/null << 'EOF'
+Section "InputClass"
+    Identifier "libinput pointer catchall"
+    MatchIsPointer "on"
+    MatchDevicePath "/dev/input/event*"
+    Driver "libinput"
+EndSection
+
+Section "InputClass"
+    Identifier "libinput keyboard catchall"
+    MatchIsKeyboard "on"
+    MatchDevicePath "/dev/input/event*"
+    Driver "libinput"
+EndSection
+
+Section "InputClass"
+    Identifier "libinput touchpad catchall"
+    MatchIsTouchpad "on"
+    MatchDevicePath "/dev/input/event*"
+    Driver "libinput"
+EndSection
+EOF
+
     # Create .xinitrc for RealDash
     sudo tee "$ROOTFS/root/.xinitrc" > /dev/null << 'EOF'
 #!/bin/sh
+# Set cursor theme and ensure cursor is visible
+if command -v xsetroot >/dev/null 2>&1; then
+  xsetroot -cursor_name left_ptr
+fi
+
 if command -v xset >/dev/null 2>&1; then
   xset -dpms
   xset s off
   xset s noblank
+  # Enable cursor
+  xset m 0 0
 fi
 
 exec /usr/bin/realdash
@@ -536,6 +667,90 @@ EOF
     
     # Enable RealDash service (but don't enable if console-only)
     sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable realdash.service" 2>/dev/null || true
+    
+    # Configure picom compositor for RealDash opacity control
+    echo "=== 7c.1. Configuring picom compositor for RealDash opacity ==="
+    
+    # Ensure picom is installed (e.g. when using --skip-rootfs, debootstrap is skipped)
+    sudo chroot "$ROOTFS" /bin/bash -c "apt-get update -qq && apt-get install -y picom" 2>&1 || echo "Warning: Could not install picom (install manually: apt-get install picom)"
+    
+    # Create picom config directory
+    sudo mkdir -p "$ROOTFS/root/.config/picom"
+    
+    # Create picom config with RealDash opacity rule
+    sudo tee "$ROOTFS/root/.config/picom/picom.conf" > /dev/null << 'EOF'
+backend = "xrender";
+vsync = true;
+detect-rounded-corners = true;
+detect-client-opacity = true;
+detect-transient = true;
+detect-client-leader = true;
+use-damage = true;
+shadow = false;
+fading = false;
+
+# Force compositing for all windows (including RealDash)
+unredir-if-possible = false;
+
+# Window rules
+rules: ({
+  # RealDash opacity control (default: 1.0 = 100% opacity / full brightness)
+  match = "class_g = 'RD' || class_g = 'rd'";
+  opacity = 1.0;
+  shadow = false;
+})
+EOF
+    
+    # Create utility script to change RealDash opacity
+    sudo tee "$ROOTFS/usr/local/bin/set-realdash-opacity" > /dev/null << 'EOF'
+#!/bin/bash
+# Usage: set-realdash-opacity <0.0-1.0>
+# Example: set-realdash-opacity 0.5
+
+if [ -z "$1" ]; then
+    echo "Usage: set-realdash-opacity <0.0-1.0>"
+    echo "Example: set-realdash-opacity 0.5"
+    exit 1
+fi
+
+OPACITY="$1"
+CONFIG_FILE="$HOME/.config/picom/picom.conf"
+
+# Update opacity in config file (picom will auto-reload)
+sed -i "s/opacity = [0-9.]*;/opacity = $OPACITY;/" "$CONFIG_FILE"
+
+echo "RealDash opacity set to $OPACITY"
+EOF
+    sudo chmod +x "$ROOTFS/usr/local/bin/set-realdash-opacity"
+    
+    # Picom systemd service: start after RealDash with DISPLAY=:0
+    sudo tee "$ROOTFS/etc/systemd/system/picom.service" > /dev/null << 'EOF'
+[Unit]
+Description=Picom compositor for RealDash opacity control
+After=realdash.service
+Wants=realdash.service
+DefaultDependencies=no
+
+[Service]
+Type=simple
+User=root
+Environment=HOME=/root
+Environment=DISPLAY=:0
+# Brief delay so RealDash/X is ready
+ExecStartPre=/bin/sleep 2
+ExecStart=/usr/bin/picom --config /root/.config/picom/picom.conf
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable picom.service" 2>/dev/null || true
+    
+    echo "✓ Picom configured for RealDash opacity control"
+    echo "  - Config: /root/.config/picom/picom.conf"
+    echo "  - Utility: set-realdash-opacity <0.0-1.0>"
+    echo "  - Picom auto-starts after RealDash (picom.service)"
     
     # Configure services to start AFTER RealDash (deferred startup for faster boot)
     echo "=== 7d. Configuring deferred service startup (after RealDash) ==="
@@ -586,7 +801,7 @@ cp "$SOURCES_DIR/linux/arch/arm64/boot/Image" "$BOOT_DIR/kernel8.img"
 
 # Create config.txt - boot directly with RPi bootloader (faster than U-Boot, works with USB)
 # U-Boot has incomplete USB support on RPi5, so we use native bootloader
-cat << 'EOF' > "$BOOT_DIR/config.txt"
+cat << EOF > "$BOOT_DIR/config.txt"
 arm_64bit=1
 device_tree=bcm2712-rpi-5-b.dtb
 kernel=kernel8.img
@@ -605,7 +820,7 @@ dtoverlay=i2c1
 
 # Enable SPI and MCP2515 CAN bus controller
 dtoverlay=spi
-dtoverlay=mcp2515-can0,oscillator=16000000,interrupt=25
+dtoverlay=mcp2515-can0,oscillator=${CAN_OSCILLATOR_FREQ},interrupt=25
 
 # Force HDMI hotplug (skip detection wait, but allow EDID for auto-resolution)
 hdmi_force_hotplug=1
@@ -627,6 +842,11 @@ usb_max_current_enable=1
 # Disable under-voltage warnings (power supply warning during shutdown)
 # Note: Pi5 doesn't fully power off - enters low-power state by design
 avoid_warnings=1
+
+# Overclock settings
+arm_freq=2800
+gpu_freq=1000
+over_voltage=4
 EOF
 
 # Create cmdline.txt for kernel parameters
