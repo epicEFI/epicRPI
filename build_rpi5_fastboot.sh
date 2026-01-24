@@ -148,7 +148,7 @@ if [[ "$SKIP_ROOTFS" == "false" ]]; then
         sudo rm -rf "$BUILD_DIR/rootfs"
         mkdir -p "$BUILD_DIR/rootfs"
         sudo debootstrap --arch=arm64 --variant=minbase \
-            --include=labwc,seatd,libseat1,busybox,kmod,udev,fish,systemd,dbus,libgl1-mesa-dri,mesa-vulkan-drivers,libwayland-client0,libwayland-server0,libegl1,libgles2,libicu76,iproute2,iputils-ping,nano,openssh-server,wget,gnupg,systemd-resolved,can-utils,xserver-xorg-core,xserver-xorg,xinit,xauth,xserver-xorg-input-libinput,x11-xserver-utils,x11-utils,cloud-guest-utils,e2fsprogs,picom \
+            --include=labwc,seatd,libseat1,busybox,kmod,udev,fish,systemd,dbus,libgl1-mesa-dri,mesa-vulkan-drivers,libwayland-client0,libwayland-server0,libegl1,libgles2,libicu76,iproute2,iputils-ping,nano,openssh-server,wget,gnupg,systemd-resolved,can-utils,xserver-xorg-core,xserver-xorg,xinit,xauth,xserver-xorg-input-libinput,x11-xserver-utils,x11-utils,cloud-guest-utils,e2fsprogs,picom,xdotool,bc,unclutter \
             trixie "$BUILD_DIR/rootfs" http://deb.debian.org/debian
     else
         echo "RootFS already exists, skipping debootstrap (delete rootfs dir to rebuild)"
@@ -631,6 +631,13 @@ if command -v xset >/dev/null 2>&1; then
   xset m 0 0
 fi
 
+# Hide cursor after inactivity (default: 5 seconds)
+# Cursor reappears on mouse movement
+if command -v unclutter >/dev/null 2>&1; then
+  export DISPLAY=:0
+  unclutter -idle 5 -root &
+fi
+
 exec /usr/bin/realdash
 EOF
     sudo chmod +x "$ROOTFS/root/.xinitrc"
@@ -671,8 +678,8 @@ EOF
     # Configure picom compositor for RealDash opacity control
     echo "=== 7c.1. Configuring picom compositor for RealDash opacity ==="
     
-    # Ensure picom is installed (e.g. when using --skip-rootfs, debootstrap is skipped)
-    sudo chroot "$ROOTFS" /bin/bash -c "apt-get update -qq && apt-get install -y picom" 2>&1 || echo "Warning: Could not install picom (install manually: apt-get install picom)"
+    # Ensure picom and dependencies are installed (e.g. when using --skip-rootfs, debootstrap is skipped)
+    sudo chroot "$ROOTFS" /bin/bash -c "apt-get update -qq && apt-get install -y picom x11-utils xdotool bc unclutter" 2>&1 || echo "Warning: Could not install picom/dependencies (install manually)"
     
     # Create picom config directory
     sudo mkdir -p "$ROOTFS/root/.config/picom"
@@ -692,36 +699,336 @@ fading = false;
 # Force compositing for all windows (including RealDash)
 unredir-if-possible = false;
 
+fading = true;
+fade-in-step = .01;
+fade-out-step = .01;
+
 # Window rules
 rules: ({
-  # RealDash opacity control (default: 1.0 = 100% opacity / full brightness)
+  # RealDash - opacity controlled via _NET_WM_WINDOW_OPACITY (picom-trans)
   match = "class_g = 'RD' || class_g = 'rd'";
-  opacity = 1.0;
+  #opacity = 1;
   shadow = false;
 })
 EOF
     
-    # Create utility script to change RealDash opacity
+    # Create utility script to change RealDash opacity (uses picom-trans for smooth updates)
     sudo tee "$ROOTFS/usr/local/bin/set-realdash-opacity" > /dev/null << 'EOF'
 #!/bin/bash
-# Usage: set-realdash-opacity <0.0-1.0>
-# Example: set-realdash-opacity 0.5
+# Usage: set-realdash-opacity <0-100>
+# Example: set-realdash-opacity 50
 
 if [ -z "$1" ]; then
-    echo "Usage: set-realdash-opacity <0.0-1.0>"
-    echo "Example: set-realdash-opacity 0.5"
+    echo "Usage: set-realdash-opacity <0-100>"
+    echo "Example: set-realdash-opacity 50"
     exit 1
 fi
 
+export DISPLAY=:0
 OPACITY="$1"
-CONFIG_FILE="$HOME/.config/picom/picom.conf"
 
-# Update opacity in config file (picom will auto-reload)
-sed -i "s/opacity = [0-9.]*;/opacity = $OPACITY;/" "$CONFIG_FILE"
+# Find RealDash window
+WIN_ID=$(xdotool search --class RD 2>/dev/null | head -1)
+
+if [ -z "$WIN_ID" ]; then
+    echo "Error: RealDash window not found" >&2
+    exit 1
+fi
+
+# Set opacity using picom-trans (smooth, no config reload)
+env LC_ALL=C picom-trans -w "$WIN_ID" -o "$OPACITY" 2>/dev/null
 
 echo "RealDash opacity set to $OPACITY"
 EOF
     sudo chmod +x "$ROOTFS/usr/local/bin/set-realdash-opacity"
+    
+    # Create unified auto-brightness script
+    sudo tee "$ROOTFS/usr/local/bin/auto-brightness" > /dev/null << 'EOF'
+#!/bin/bash
+# Unified auto-brightness control for RealDash
+# Usage: auto-brightness {setup|start|stop|status|set <0-100>|daemon}
+
+CONFIG_FILE="/root/.config/auto-brightness.conf"
+PID_FILE="/var/run/auto-brightness.pid"
+SENSOR_PATH="/sys/bus/iio/devices/iio:device0/in_illuminance_raw"
+
+# Defaults (overridden by config)
+UPDATE_INTERVAL=1
+SAMPLE_SIZE=5
+
+export DISPLAY=:0
+
+get_realdash_window() {
+    xdotool search --class RD 2>/dev/null | head -1
+}
+
+set_brightness() {
+    local brightness=$1
+    local win_id=$(get_realdash_window)
+    
+    if [ -z "$win_id" ]; then
+        echo "Error: RealDash window not found" >&2
+        return 1
+    fi
+    
+    env LC_ALL=C picom-trans -w "$win_id" -o "$brightness" 2>/dev/null
+    echo "Brightness set to $brightness"
+}
+
+setup_calibration() {
+    # Try to load sensor if not available
+    if [ ! -f "$SENSOR_PATH" ]; then
+        echo "Sensor not found, attempting to load..."
+        modprobe bh1750 2>/dev/null || true
+        sleep 1
+        # Try to add sensor to I2C bus
+        if [ -e /sys/bus/i2c/devices/i2c-1/new_device ]; then
+            echo bh1750 0x23 > /sys/bus/i2c/devices/i2c-1/new_device 2>/dev/null || true
+            sleep 1
+        fi
+    fi
+    
+    if [ ! -f "$SENSOR_PATH" ]; then
+        echo "WARNING: Light sensor not found at $SENSOR_PATH" >&2
+        echo "You can still set a constant brightness with: auto-brightness set <0-100>" >&2
+        echo "Or connect the sensor and run setup again." >&2
+        exit 1
+    fi
+    
+    echo "=== Auto-Brightness Calibration ==="
+    echo ""
+    echo "Step 1: Cover sensor (low light)"
+    read -p "Press Enter when sensor is covered..."
+    low_light=$(cat "$SENSOR_PATH")
+    echo "  Low light reading: $low_light"
+    read -p "Enter brightness (0-100) for low light [30]: " low_bright
+    low_bright=${low_bright:-30}
+    
+    echo ""
+    echo "Step 2: Expose sensor to bright light"
+    read -p "Press Enter when sensor is in bright light..."
+    high_light=$(cat "$SENSOR_PATH")
+    echo "  High light reading: $high_light"
+    read -p "Enter brightness (0-100) for bright light [100]: " high_bright
+    high_bright=${high_bright:-100}
+    
+    echo ""
+    echo "Step 3: Sample rate (update interval in seconds)"
+    read -p "Enter sample rate in seconds [1]: " update_interval
+    update_interval=${update_interval:-1}
+    
+    echo ""
+    echo "Step 4: Averaging sample count (running average window)"
+    read -p "Enter number of samples for averaging [5]: " sample_size
+    sample_size=${sample_size:-5}
+    
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    cat > "$CONFIG_FILE" << CONFIGEOF
+LOW_LIGHT=$low_light
+LOW_BRIGHTNESS=$low_bright
+HIGH_LIGHT=$high_light
+HIGH_BRIGHTNESS=$high_bright
+UPDATE_INTERVAL=$update_interval
+SAMPLE_SIZE=$sample_size
+CONFIGEOF
+    
+    echo ""
+    echo "Calibration saved to $CONFIG_FILE"
+    echo "  Low: $low_light -> $low_bright"
+    echo "  High: $high_light -> $high_bright"
+    echo "  Sample rate: ${update_interval}s"
+    echo "  Averaging samples: $sample_size"
+}
+
+map_light_to_brightness() {
+    local light=$1
+    local low_light=${LOW_LIGHT:-50}
+    local low_bright=${LOW_BRIGHTNESS:-30}
+    local high_light=${HIGH_LIGHT:-500}
+    local high_bright=${HIGH_BRIGHTNESS:-100}
+    
+    if [ "$light" -le "$low_light" ]; then
+        echo "$low_bright"
+    elif [ "$light" -ge "$high_light" ]; then
+        echo "$high_bright"
+    else
+        local range=$((high_light - low_light))
+        local position=$((light - low_light))
+        local ratio=$((position * 1000 / range))
+        local brightness_range=$((high_bright - low_bright))
+        echo $((low_bright + (brightness_range * ratio / 1000)))
+    fi
+}
+
+run_daemon() {
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+    fi
+    
+    # Apply config (or defaults)
+    UPDATE_INTERVAL=${UPDATE_INTERVAL:-1}
+    SAMPLE_SIZE=${SAMPLE_SIZE:-5}
+    
+    local win_id=$(get_realdash_window)
+    if [ -z "$win_id" ]; then
+        echo "Error: RealDash window not found" >&2
+        exit 1
+    fi
+    
+    declare -a samples=()
+    local current_index=0
+    
+    # Default brightness if no sensor (100% = full brightness)
+    local default_brightness=100
+    
+    # Check if config has a constant brightness setting
+    if [ -f "$CONFIG_FILE" ] && grep -q "^CONSTANT_BRIGHTNESS=" "$CONFIG_FILE"; then
+        source "$CONFIG_FILE"
+        default_brightness=${CONSTANT_BRIGHTNESS:-100}
+    fi
+    
+    while true; do
+        if [ -f "$SENSOR_PATH" ]; then
+            # Sensor available - use auto-brightness
+            local light_raw=$(cat "$SENSOR_PATH" 2>/dev/null || echo "0")
+            
+            if [ -n "$light_raw" ] && [ "$light_raw" -gt 0 ]; then
+                local target_brightness=$(map_light_to_brightness "$light_raw")
+                
+                samples[$current_index]=$target_brightness
+                current_index=$(((current_index + 1) % SAMPLE_SIZE))
+                
+                local sum=0
+                local count=0
+                for sample in "${samples[@]}"; do
+                    if [ -n "$sample" ]; then
+                        sum=$((sum + sample))
+                        count=$((count + 1))
+                    fi
+                done
+                
+                if [ $count -gt 0 ]; then
+                    local smoothed=$((sum / count))
+                    env LC_ALL=C picom-trans -w "$win_id" -o "$smoothed" 2>/dev/null
+                fi
+            fi
+        else
+            # No sensor - use constant brightness (or default)
+            env LC_ALL=C picom-trans -w "$win_id" -o "$default_brightness" 2>/dev/null
+        fi
+        
+        sleep "$UPDATE_INTERVAL"
+    done
+}
+
+case "$1" in
+    setup)
+        setup_calibration
+        ;;
+    
+    start)
+        if pgrep -f "auto-brightness daemon" >/dev/null; then
+            echo "Already running"
+        else
+            nohup "$0" daemon > /dev/null 2>&1 &
+            echo $! > "$PID_FILE"
+            echo "Started (PID: $(cat $PID_FILE))"
+        fi
+        ;;
+    
+    stop)
+        if [ -f "$PID_FILE" ]; then
+            kill $(cat "$PID_FILE") 2>/dev/null
+            rm -f "$PID_FILE"
+        fi
+        pkill -f "auto-brightness daemon"
+        echo "Stopped"
+        ;;
+    
+    status)
+        if pgrep -f "auto-brightness daemon" >/dev/null; then
+            echo "Auto-brightness: RUNNING"
+            if [ -f "$CONFIG_FILE" ]; then
+                echo "Config:"
+                cat "$CONFIG_FILE"
+            fi
+        else
+            echo "Auto-brightness: STOPPED"
+        fi
+        ;;
+    
+    set)
+        if [ -z "$2" ]; then
+            echo "Usage: auto-brightness set <0-100>"
+            exit 1
+        fi
+        "$0" stop
+        set_brightness "$2"
+        ;;
+    
+    daemon)
+        run_daemon
+        ;;
+    
+    *)
+        echo "Usage: auto-brightness {setup|start|stop|status|set <0-100>}"
+        echo ""
+        echo "Commands:"
+        echo "  setup  - Calibrate auto-brightness (low/high points, sample rate, averaging)"
+        echo "  start  - Start auto-brightness daemon"
+        echo "  stop   - Stop auto-brightness daemon"
+        echo "  status - Show current status and config"
+        echo "  set    - Set constant brightness (stops auto)"
+        exit 1
+        ;;
+esac
+EOF
+    sudo chmod +x "$ROOTFS/usr/local/bin/auto-brightness"
+    
+    # Create service to auto-load BH1750 sensor on boot
+    sudo tee "$ROOTFS/etc/systemd/system/bh1750-sensor.service" > /dev/null << 'EOF'
+[Unit]
+Description=Load BH1750 light sensor
+After=local-fs.target
+Before=auto-brightness.service
+
+[Service]
+Type=oneshot
+# Load driver module
+ExecStart=/sbin/modprobe bh1750
+# Add sensor to I2C bus (try both common addresses)
+ExecStart=/bin/sh -c 'echo bh1750 0x23 > /sys/bus/i2c/devices/i2c-1/new_device 2>/dev/null || true'
+ExecStart=/bin/sh -c 'sleep 1; echo bh1750 0x5C > /sys/bus/i2c/devices/i2c-1/new_device 2>/dev/null || true'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable bh1750-sensor.service" 2>/dev/null || true
+    
+    # Create systemd service for auto-brightness (starts after RealDash and sensor)
+    sudo tee "$ROOTFS/etc/systemd/system/auto-brightness.service" > /dev/null << 'EOF'
+[Unit]
+Description=Auto-brightness control for RealDash
+After=realdash.service picom.service bh1750-sensor.service
+Wants=realdash.service picom.service
+DefaultDependencies=no
+
+[Service]
+Type=simple
+User=root
+Environment=HOME=/root
+Environment=DISPLAY=:0
+# Brief delay so RealDash/X is ready
+ExecStartPre=/bin/sleep 3
+ExecStart=/usr/local/bin/auto-brightness daemon
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable auto-brightness.service" 2>/dev/null || true
     
     # Picom systemd service: start after RealDash with DISPLAY=:0
     sudo tee "$ROOTFS/etc/systemd/system/picom.service" > /dev/null << 'EOF'
@@ -749,8 +1056,11 @@ EOF
     
     echo "✓ Picom configured for RealDash opacity control"
     echo "  - Config: /root/.config/picom/picom.conf"
-    echo "  - Utility: set-realdash-opacity <0.0-1.0>"
+    echo "  - Manual control: set-realdash-opacity <0-100>"
+    echo "  - Auto-brightness: auto-brightness {setup|start|stop|status|set <0-100>}"
     echo "  - Picom auto-starts after RealDash (picom.service)"
+    echo "  - BH1750 sensor auto-loads on boot (bh1750-sensor.service)"
+    echo "  - Auto-brightness auto-starts after RealDash (auto-brightness.service)"
     
     # Configure services to start AFTER RealDash (deferred startup for faster boot)
     echo "=== 7d. Configuring deferred service startup (after RealDash) ==="
