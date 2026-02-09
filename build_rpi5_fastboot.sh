@@ -1,11 +1,12 @@
 #!/bin/bash
 # RPi5 Fast Boot Master Build Script
 # This script automates the entire process from a fresh WSL environment.
-# Usage: ./build_rpi5_fastboot.sh [--console-only] [--skip-kernel] [--skip-rootfs] [--quick]
+# Usage: ./build_rpi5_fastboot.sh [--console-only] [--skip-kernel] [--skip-rootfs] [--quick] [--can-oscillator=FREQ]
 
 set -e
 
 # Configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="$HOME/rpi5-fastboot"
 SOURCES_DIR="$BUILD_DIR/sources"
 WINDOWS_WORKSPACE="/mnt/c/rpi-fastboot"
@@ -13,6 +14,8 @@ IMG_NAME="rpi5-fastboot.img"
 CONSOLE_ONLY=false
 SKIP_KERNEL=false
 SKIP_ROOTFS=false
+REALDASH_DEB="$SCRIPT_DIR/realdash-mrd_2.6.2-1_arm64.deb"
+CAN_OSCILLATOR_FREQ=12000000  # Default to 12 MHz
 
 # Parse arguments
 for arg in "$@"; do
@@ -34,8 +37,18 @@ for arg in "$@"; do
             SKIP_ROOTFS=true
             echo "[OPT] Quick mode: skipping kernel and rootfs builds"
             ;;
+        --can-oscillator=*)
+            CAN_OSCILLATOR_FREQ="${arg#*=}"
+            echo "[OPT] CAN bus oscillator frequency set to ${CAN_OSCILLATOR_FREQ} Hz"
+            ;;
+        --can-oscillator)
+            echo "Error: --can-oscillator requires a value (e.g., --can-oscillator=12000000)"
+            exit 1
+            ;;
     esac
 done
+
+echo "[CONFIG] CAN bus oscillator frequency: ${CAN_OSCILLATOR_FREQ} Hz (default: 12 MHz)"
 
 echo "=== 1. Installing System Dependencies ==="
 sudo apt-get update
@@ -135,7 +148,7 @@ if [[ "$SKIP_ROOTFS" == "false" ]]; then
         sudo rm -rf "$BUILD_DIR/rootfs"
         mkdir -p "$BUILD_DIR/rootfs"
         sudo debootstrap --arch=arm64 --variant=minbase \
-            --include=labwc,seatd,libseat1,busybox,kmod,udev,fish,systemd,dbus,libgl1-mesa-dri,mesa-vulkan-drivers,libwayland-client0,libwayland-server0,libegl1,libgles2,libicu76,iproute2,iputils-ping,nano,openssh-server,wget,gnupg,systemd-resolved,can-utils \
+            --include=labwc,seatd,libseat1,busybox,kmod,udev,fish,systemd,dbus,libgl1-mesa-dri,mesa-vulkan-drivers,libwayland-client0,libwayland-server0,libegl1,libgles2,libicu76,iproute2,iputils-ping,nano,openssh-server,wget,gnupg,systemd-resolved,can-utils,xserver-xorg-core,xserver-xorg,xinit,xauth,xserver-xorg-input-libinput,x11-xserver-utils,x11-utils,cloud-guest-utils,e2fsprogs,picom,xdotool,bc,unclutter \
             trixie "$BUILD_DIR/rootfs" http://deb.debian.org/debian
     else
         echo "RootFS already exists, skipping debootstrap (delete rootfs dir to rebuild)"
@@ -156,7 +169,9 @@ ROOTFS="$BUILD_DIR/rootfs"
 sudo mkdir -p "$ROOTFS/etc/apt/sources.list.d"
 sudo mkdir -p "$ROOTFS/usr/share/keyrings"
 # Download GPG key
-sudo wget -q -O - https://archive.raspberrypi.org/debian/raspberrypi.gpg.key | sudo gpg --dearmor -o "$ROOTFS/usr/share/keyrings/raspberrypi-archive-keyring.gpg"
+# Make this non-interactive: always overwrite existing keyring file.
+sudo rm -f "$ROOTFS/usr/share/keyrings/raspberrypi-archive-keyring.gpg"
+sudo wget -q -O - https://archive.raspberrypi.org/debian/raspberrypi.gpg.key | sudo gpg --batch --yes --dearmor -o "$ROOTFS/usr/share/keyrings/raspberrypi-archive-keyring.gpg"
 
 # Configure main Debian sources with all components (main, contrib, non-free, non-free-firmware)
 # Note: "universe multiverse restricted" are Ubuntu terms; Debian uses "main contrib non-free"
@@ -175,6 +190,34 @@ EOF
 echo "=== 7a. Installing Raspberry Pi Foundation Packages ==="
 sudo chroot "$ROOTFS" /bin/bash -c "apt-get update" 2>&1
 sudo chroot "$ROOTFS" /bin/bash -c "apt-get install -y rpi-eeprom raspi-config" 2>&1 || echo "Warning: Could not install rpi-eeprom/raspi-config (may need manual install after boot)"
+
+# Ensure Xorg launcher pieces exist (some repos/images end up without /usr/bin/xinit even if Xorg is present)
+sudo chroot "$ROOTFS" /bin/bash -c "apt-get install -y xinit x11-xserver-utils" 2>&1 || echo "Warning: Could not install xinit/x11-xserver-utils (may need manual install after boot)"
+
+# Ensure filesystem expansion tools are installed (critical for first boot)
+echo "=== 7a.2 Installing Filesystem Expansion Tools ==="
+sudo chroot "$ROOTFS" /bin/bash -c "apt-get install -y cloud-guest-utils e2fsprogs" 2>&1 || echo "Warning: Could not install cloud-guest-utils/e2fsprogs (filesystem expansion may fail)"
+
+# Disable automatic EEPROM update checks at boot (saves boot time; update manually when desired)
+sudo tee "$ROOTFS/etc/default/rpi-eeprom-update" > /dev/null << 'EOF'
+# Disable auto-updates at boot; update manually when desired:
+#   sudo rpi-eeprom-update -a
+RPI_EEPROM_UPDATE=0
+EOF
+sudo chroot "$ROOTFS" /bin/bash -c "systemctl disable rpi-eeprom-update.service rpi-eeprom-update.timer 2>/dev/null || true"
+sudo chroot "$ROOTFS" /bin/bash -c "systemctl mask rpi-eeprom-update.service 2>/dev/null || true"
+
+# Install RealDash .deb into the image (if present)
+echo "=== 7a.1 Installing RealDash (local .deb) ==="
+if [[ -f "$REALDASH_DEB" ]]; then
+    sudo mkdir -p "$ROOTFS/tmp"
+    sudo cp "$REALDASH_DEB" "$ROOTFS/tmp/"
+    # dpkg first, then fix dependencies via apt if needed
+    sudo chroot "$ROOTFS" /bin/bash -c "dpkg -i /tmp/$(basename "$REALDASH_DEB") || apt-get -y -f install"
+    sudo rm -f "$ROOTFS/tmp/$(basename "$REALDASH_DEB")"
+else
+    echo "Warning: RealDash .deb not found at $REALDASH_DEB (skipping install)"
+fi
 
 # Configure EEPROM boot order to prioritize USB (0xf14 = USB, then SD, then network)
 # This improves boot times by scanning USB first
@@ -205,8 +248,8 @@ sudo mkdir -p "$ROOTFS/etc/systemd/system"
 sudo tee "$ROOTFS/etc/systemd/system/apply-eeprom-config.service" > /dev/null << 'EOF'
 [Unit]
 Description=Apply EEPROM Boot Order Configuration
-After=network-online.target
-Wants=network-online.target
+ConditionPathExists=!/var/lib/rpi-eeprom-config-applied
+After=local-fs.target
 
 [Service]
 Type=oneshot
@@ -217,6 +260,91 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
 sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable apply-eeprom-config.service" 2>/dev/null || true
+
+# Configure filesystem expansion on first boot
+echo "=== 7b.1. Configuring Filesystem Expansion ==="
+sudo tee "$ROOTFS/usr/local/bin/expand-filesystem" > /dev/null << 'EOF'
+#!/bin/bash
+# Expand root filesystem to fill available space on first boot
+set -e  # Exit on error for better debugging
+
+if [ ! -f /var/lib/filesystem-expanded ]; then
+    # Find the root device (usually /dev/sda2 or /dev/mmcblk0p2)
+    ROOT_DEV=$(findmnt -n -o SOURCE /)
+    if [ -z "$ROOT_DEV" ]; then
+        ROOT_DEV=$(df -h / | tail -1 | awk '{print $1}')
+    fi
+    
+    echo "Expanding filesystem on $ROOT_DEV" >&2
+    
+    # Extract device and partition number (e.g., /dev/sda2 -> sda 2)
+    if [[ "$ROOT_DEV" =~ /dev/([a-z]+)([0-9]+) ]]; then
+        DISK_DEV="/dev/${BASH_REMATCH[1]}"
+        PART_NUM="${BASH_REMATCH[2]}"
+        
+        echo "Disk: $DISK_DEV, Partition: $PART_NUM" >&2
+        
+        # Resize partition using growpart (preferred) or parted (fallback)
+        if command -v growpart >/dev/null 2>&1; then
+            echo "Using growpart to resize partition..." >&2
+            growpart "$DISK_DEV" "$PART_NUM" || {
+                echo "ERROR: growpart failed" >&2
+                exit 1
+            }
+        elif command -v parted >/dev/null 2>&1; then
+            echo "Using parted to resize partition..." >&2
+            parted "$DISK_DEV" resizepart "$PART_NUM" 100% || {
+                echo "ERROR: parted resizepart failed" >&2
+                exit 1
+            }
+        else
+            echo "ERROR: Neither growpart nor parted found. Install cloud-guest-utils or parted." >&2
+            exit 1
+        fi
+        
+        # Resize filesystem
+        if command -v resize2fs >/dev/null 2>&1; then
+            echo "Resizing filesystem..." >&2
+            resize2fs "$ROOT_DEV" || {
+                echo "ERROR: resize2fs failed" >&2
+                exit 1
+            }
+        else
+            echo "ERROR: resize2fs not found. Install e2fsprogs." >&2
+            exit 1
+        fi
+        
+        # Mark as expanded
+        touch /var/lib/filesystem-expanded
+        echo "Filesystem expansion complete!" >&2
+    else
+        echo "ERROR: Could not parse root device: $ROOT_DEV" >&2
+        exit 1
+    fi
+else
+    echo "Filesystem already expanded, skipping." >&2
+fi
+EOF
+sudo chmod +x "$ROOTFS/usr/local/bin/expand-filesystem"
+
+# Create systemd service to run on first boot
+sudo tee "$ROOTFS/etc/systemd/system/expand-filesystem.service" > /dev/null << 'EOF'
+[Unit]
+Description=Expand Root Filesystem
+ConditionPathExists=!/var/lib/filesystem-expanded
+After=systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/expand-filesystem
+StandardOutput=journal
+StandardError=journal
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable expand-filesystem.service" 2>/dev/null || true
 
 # Set proper hostname (not inherited from WSL)
 echo "rpi5" | sudo tee "$ROOTFS/etc/hostname" > /dev/null
@@ -274,7 +402,10 @@ sudo tee "$ROOTFS/etc/systemd/resolved.conf" > /dev/null << 'EOF'
 DNS=8.8.8.8 8.8.4.4 1.1.1.1
 FallbackDNS=8.8.8.8 8.8.4.4
 EOF
-sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable systemd-resolved" 2>/dev/null || true
+# Don't enable systemd-resolved at boot; we'll start it after RealDash for fastest splash-to-dash.
+sudo chroot "$ROOTFS" /bin/bash -c "systemctl disable systemd-resolved.service 2>/dev/null || true"
+# If this image rootfs was reused, remove any old drop-ins that create ordering cycles.
+sudo rm -f "$ROOTFS/etc/systemd/system/systemd-resolved.service.d/after-realdash.conf" 2>/dev/null || true
 
 # Create symlink for systemd-resolved to work properly
 # Remove any existing resolv.conf and create symlink to systemd-resolved stub
@@ -292,11 +423,16 @@ EOF
 
 # Enable seatd for Wayland seat management
 sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable seatd" 2>/dev/null || true
-# Enable systemd-networkd for ethernet networking
-sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable systemd-networkd" 2>/dev/null || true
+# Don't enable systemd-networkd at boot; we'll start it after RealDash for fastest splash-to-dash.
+sudo chroot "$ROOTFS" /bin/bash -c "systemctl disable systemd-networkd.service 2>/dev/null || true"
+# If this image rootfs was reused, remove any old drop-ins that create ordering cycles.
+sudo rm -f "$ROOTFS/etc/systemd/system/systemd-networkd.service.d/after-realdash.conf" 2>/dev/null || true
+# Disable systemd-networkd-wait-online to avoid boot delay
+sudo chroot "$ROOTFS" /bin/bash -c "systemctl disable systemd-networkd-wait-online.service" 2>/dev/null || true
 # Disable SSH from auto-starting (installed but not enabled)
 sudo chroot "$ROOTFS" /bin/bash -c "systemctl disable ssh" 2>/dev/null || true
 sudo chroot "$ROOTFS" /bin/bash -c "systemctl disable ssh.service" 2>/dev/null || true
+sudo rm -f "$ROOTFS/etc/systemd/system/ssh.service.d/after-realdash.conf" 2>/dev/null || true
 # Add root to seat group for direct access
 sudo chroot "$ROOTFS" /bin/bash -c "usermod -a -G video,render,input root" 2>/dev/null || true
 
@@ -317,34 +453,22 @@ if ! grep -q "PermitRootLogin" "$ROOTFS/etc/ssh/sshd_config"; then
     echo "PermitRootLogin yes" | sudo tee -a "$ROOTFS/etc/ssh/sshd_config" > /dev/null
 fi
 
-# Auto-login on tty1
-sudo mkdir -p "$ROOTFS/etc/systemd/system/getty@tty1.service.d/"
-sudo tee "$ROOTFS/etc/systemd/system/getty@tty1.service.d/override.conf" > /dev/null << 'EOF'
+# Auto-login on tty1 (only if console-only mode, otherwise RealDash service handles tty1)
+if [[ "$CONSOLE_ONLY" == "true" ]]; then
+    sudo mkdir -p "$ROOTFS/etc/systemd/system/getty@tty1.service.d/"
+    sudo tee "$ROOTFS/etc/systemd/system/getty@tty1.service.d/override.conf" > /dev/null << 'EOF'
 [Service]
 ExecStart=
 ExecStart=-/sbin/agetty --autologin root --noclear %I $TERM
 Type=idle
 EOF
+fi
 
-# Fish config for auto-start labwc/Wayland (only if not console-only mode)
+# Fish config - Wayland auto-start removed (start manually if needed)
 sudo mkdir -p "$ROOTFS/root/.config/fish"
 sudo mkdir -p "$ROOTFS/root/.config/labwc"
 
-if [[ "$CONSOLE_ONLY" == "false" ]]; then
-    sudo tee "$ROOTFS/root/.config/fish/config.fish" > /dev/null << 'EOF'
-# Clear any inherited environment variables from build
-set -e DISPLAY
-set -e WAYLAND_DISPLAY
-
-if test (tty) = "/dev/tty1"
-    # Start labwc (Wayland compositor)
-    set -x XDG_RUNTIME_DIR /run/user/0
-    exec labwc
-end
-EOF
-else
-    sudo tee "$ROOTFS/root/.config/fish/config.fish" > /dev/null << 'EOF'
-# Console-only mode: Wayland auto-start disabled for debugging
+sudo tee "$ROOTFS/root/.config/fish/config.fish" > /dev/null << 'EOF'
 # Clear any inherited environment variables from build
 set -e DISPLAY
 set -e WAYLAND_DISPLAY
@@ -355,7 +479,6 @@ function sw
     labwc
 end
 EOF
-fi
 
 # Create a clean .profile that unsets inherited variables
 sudo tee "$ROOTFS/root/.profile" > /dev/null << 'EOF'
@@ -404,6 +527,578 @@ exec labwc "$@"
 EOF
 sudo chmod +x "$ROOTFS/usr/local/bin/start-wayland"
 
+# Configure Xorg for RealDash (if not console-only mode)
+if [[ "$CONSOLE_ONLY" == "false" ]]; then
+    echo "=== 7c. Configuring Xorg for RealDash ==="
+    
+    # Create Xorg configuration for Pi5 DRM/KMS
+    # Pi5 typically has: card0=v3d (3D), card1=vc4 (display). However, Xorg sometimes
+    # picks the wrong "primary" GPU at boot and exits with "no screens found".
+    # To make this robust, generate a tiny Xorg snippet at boot that selects the DRM
+    # card that actually has a connected HDMI connector.
+    sudo mkdir -p "$ROOTFS/etc/X11/xorg.conf.d"
+
+    # Script that selects kmsdev based on connected HDMI
+    sudo mkdir -p "$ROOTFS/usr/local/bin"
+    sudo tee "$ROOTFS/usr/local/bin/select-kmsdev" > /dev/null << 'EOF'
+#!/bin/sh
+set -eu
+
+OUT="/etc/X11/xorg.conf.d/99-kmsdev.conf"
+
+# Prefer a DRM card that has a connected HDMI connector.
+pick_card=""
+for s in /sys/class/drm/card*-HDMI-A-*/status; do
+  [ -e "$s" ] || continue
+  if [ "$(cat "$s" 2>/dev/null || echo "")" = "connected" ]; then
+    # e.g. /sys/class/drm/card1-HDMI-A-1/status -> card1
+    base="$(basename "$(dirname "$s")")"
+    pick_card="${base%%-*}"
+    break
+  fi
+done
+
+# Fallback: Pi 5 commonly uses card1 for the display controller.
+if [ -z "$pick_card" ]; then
+  pick_card="card1"
+fi
+
+cat > "$OUT" <<INNER
+Section "Device"
+  Identifier "RPiKMS"
+  Driver "modesetting"
+  Option "kmsdev" "/dev/dri/${pick_card}"
+  Option "PrimaryGPU" "true"
+EndSection
+INNER
+EOF
+    sudo chmod +x "$ROOTFS/usr/local/bin/select-kmsdev"
+
+    # systemd unit to generate the snippet before starting RealDash
+    sudo tee "$ROOTFS/etc/systemd/system/realdash-kmsdev.service" > /dev/null << 'EOF'
+[Unit]
+Description=Select DRM kmsdev for Xorg (before RealDash)
+DefaultDependencies=no
+After=systemd-udev-settle.service
+Before=realdash.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/select-kmsdev
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable realdash-kmsdev.service" 2>/dev/null || true
+    
+    # Configure Xorg input devices for mouse cursor
+    sudo tee "$ROOTFS/etc/X11/xorg.conf.d/40-libinput.conf" > /dev/null << 'EOF'
+Section "InputClass"
+    Identifier "libinput pointer catchall"
+    MatchIsPointer "on"
+    MatchDevicePath "/dev/input/event*"
+    Driver "libinput"
+EndSection
+
+Section "InputClass"
+    Identifier "libinput keyboard catchall"
+    MatchIsKeyboard "on"
+    MatchDevicePath "/dev/input/event*"
+    Driver "libinput"
+EndSection
+
+Section "InputClass"
+    Identifier "libinput touchpad catchall"
+    MatchIsTouchpad "on"
+    MatchDevicePath "/dev/input/event*"
+    Driver "libinput"
+EndSection
+EOF
+
+    # Create .xinitrc for RealDash
+    sudo tee "$ROOTFS/root/.xinitrc" > /dev/null << 'EOF'
+#!/bin/sh
+# Set cursor theme and ensure cursor is visible
+if command -v xsetroot >/dev/null 2>&1; then
+  xsetroot -cursor_name left_ptr
+fi
+
+if command -v xset >/dev/null 2>&1; then
+  xset -dpms
+  xset s off
+  xset s noblank
+  # Enable cursor
+  xset m 0 0
+fi
+
+# Hide cursor after inactivity (default: 5 seconds)
+# Cursor reappears on mouse movement
+if command -v unclutter >/dev/null 2>&1; then
+  export DISPLAY=:0
+  unclutter -idle 5 -root &
+fi
+
+exec /usr/bin/realdash
+EOF
+    sudo chmod +x "$ROOTFS/root/.xinitrc"
+    
+    # Create systemd service to auto-start RealDash on boot
+    # Use /bin/sh -c to let shell find xinit via PATH (more robust than hardcoding /usr/bin/xinit)
+    sudo tee "$ROOTFS/etc/systemd/system/realdash.service" > /dev/null << 'EOF'
+[Unit]
+Description=RealDash (Xorg on tty1)
+After=systemd-user-sessions.service
+After=seatd.service
+Wants=seatd.service
+Conflicts=getty@tty1.service
+
+[Service]
+User=root
+WorkingDirectory=/root
+Environment=HOME=/root
+Environment=DISPLAY=:0
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+ExecStart=/bin/sh -c "xinit /root/.xinitrc -- :0 -nolisten tcp -keeptty vt1"
+Restart=always
+RestartSec=0.5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    
+    # Enable RealDash service (but don't enable if console-only)
+    sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable realdash.service" 2>/dev/null || true
+    
+    # Configure picom compositor for RealDash opacity control
+    echo "=== 7c.1. Configuring picom compositor for RealDash opacity ==="
+    
+    # Ensure picom and dependencies are installed (e.g. when using --skip-rootfs, debootstrap is skipped)
+    sudo chroot "$ROOTFS" /bin/bash -c "apt-get update -qq && apt-get install -y picom x11-utils xdotool bc unclutter" 2>&1 || echo "Warning: Could not install picom/dependencies (install manually)"
+    
+    # Create picom config directory
+    sudo mkdir -p "$ROOTFS/root/.config/picom"
+    
+    # Create picom config with RealDash opacity rule
+    sudo tee "$ROOTFS/root/.config/picom/picom.conf" > /dev/null << 'EOF'
+backend = "xrender";
+vsync = true;
+detect-rounded-corners = true;
+detect-client-opacity = true;
+detect-transient = true;
+detect-client-leader = true;
+use-damage = true;
+shadow = false;
+fading = false;
+
+# Force compositing for all windows (including RealDash)
+unredir-if-possible = false;
+
+fading = true;
+fade-in-step = .01;
+fade-out-step = .01;
+
+# Window rules
+rules: ({
+  # RealDash - opacity controlled via _NET_WM_WINDOW_OPACITY (picom-trans)
+  match = "class_g = 'RD' || class_g = 'rd'";
+  #opacity = 1;
+  shadow = false;
+})
+EOF
+    
+    # Create utility script to change RealDash opacity (uses picom-trans for smooth updates)
+    sudo tee "$ROOTFS/usr/local/bin/set-realdash-opacity" > /dev/null << 'EOF'
+#!/bin/bash
+# Usage: set-realdash-opacity <0-100>
+# Example: set-realdash-opacity 50
+
+if [ -z "$1" ]; then
+    echo "Usage: set-realdash-opacity <0-100>"
+    echo "Example: set-realdash-opacity 50"
+    exit 1
+fi
+
+export DISPLAY=:0
+OPACITY="$1"
+
+# Find RealDash window
+WIN_ID=$(xdotool search --class RD 2>/dev/null | head -1)
+
+if [ -z "$WIN_ID" ]; then
+    echo "Error: RealDash window not found" >&2
+    exit 1
+fi
+
+# Set opacity using picom-trans (smooth, no config reload)
+env LC_ALL=C picom-trans -w "$WIN_ID" -o "$OPACITY" 2>/dev/null
+
+echo "RealDash opacity set to $OPACITY"
+EOF
+    sudo chmod +x "$ROOTFS/usr/local/bin/set-realdash-opacity"
+    
+    # Create unified auto-brightness script
+    sudo tee "$ROOTFS/usr/local/bin/auto-brightness" > /dev/null << 'EOF'
+#!/bin/bash
+# Unified auto-brightness control for RealDash
+# Usage: auto-brightness {setup|start|stop|status|set <0-100>|daemon}
+
+CONFIG_FILE="/root/.config/auto-brightness.conf"
+PID_FILE="/var/run/auto-brightness.pid"
+SENSOR_PATH="/sys/bus/iio/devices/iio:device0/in_illuminance_raw"
+
+# Defaults (overridden by config)
+UPDATE_INTERVAL=1
+SAMPLE_SIZE=5
+
+export DISPLAY=:0
+
+get_realdash_window() {
+    xdotool search --class RD 2>/dev/null | head -1
+}
+
+set_brightness() {
+    local brightness=$1
+    local win_id=$(get_realdash_window)
+    
+    if [ -z "$win_id" ]; then
+        echo "Error: RealDash window not found" >&2
+        return 1
+    fi
+    
+    env LC_ALL=C picom-trans -w "$win_id" -o "$brightness" 2>/dev/null
+    echo "Brightness set to $brightness"
+}
+
+setup_calibration() {
+    # Try to load sensor if not available
+    if [ ! -f "$SENSOR_PATH" ]; then
+        echo "Sensor not found, attempting to load..."
+        modprobe bh1750 2>/dev/null || true
+        sleep 1
+        # Try to add sensor to I2C bus
+        if [ -e /sys/bus/i2c/devices/i2c-1/new_device ]; then
+            echo bh1750 0x23 > /sys/bus/i2c/devices/i2c-1/new_device 2>/dev/null || true
+            sleep 1
+        fi
+    fi
+    
+    if [ ! -f "$SENSOR_PATH" ]; then
+        echo "WARNING: Light sensor not found at $SENSOR_PATH" >&2
+        echo "You can still set a constant brightness with: auto-brightness set <0-100>" >&2
+        echo "Or connect the sensor and run setup again." >&2
+        exit 1
+    fi
+    
+    echo "=== Auto-Brightness Calibration ==="
+    echo ""
+    echo "Step 1: Cover sensor (low light)"
+    read -p "Press Enter when sensor is covered..."
+    low_light=$(cat "$SENSOR_PATH")
+    echo "  Low light reading: $low_light"
+    read -p "Enter brightness (0-100) for low light [30]: " low_bright
+    low_bright=${low_bright:-30}
+    
+    echo ""
+    echo "Step 2: Expose sensor to bright light"
+    read -p "Press Enter when sensor is in bright light..."
+    high_light=$(cat "$SENSOR_PATH")
+    echo "  High light reading: $high_light"
+    read -p "Enter brightness (0-100) for bright light [100]: " high_bright
+    high_bright=${high_bright:-100}
+    
+    echo ""
+    echo "Step 3: Sample rate (update interval in seconds)"
+    read -p "Enter sample rate in seconds [1]: " update_interval
+    update_interval=${update_interval:-1}
+    
+    echo ""
+    echo "Step 4: Averaging sample count (running average window)"
+    read -p "Enter number of samples for averaging [5]: " sample_size
+    sample_size=${sample_size:-5}
+    
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    cat > "$CONFIG_FILE" << CONFIGEOF
+LOW_LIGHT=$low_light
+LOW_BRIGHTNESS=$low_bright
+HIGH_LIGHT=$high_light
+HIGH_BRIGHTNESS=$high_bright
+UPDATE_INTERVAL=$update_interval
+SAMPLE_SIZE=$sample_size
+CONFIGEOF
+    
+    echo ""
+    echo "Calibration saved to $CONFIG_FILE"
+    echo "  Low: $low_light -> $low_bright"
+    echo "  High: $high_light -> $high_bright"
+    echo "  Sample rate: ${update_interval}s"
+    echo "  Averaging samples: $sample_size"
+}
+
+map_light_to_brightness() {
+    local light=$1
+    local low_light=${LOW_LIGHT:-50}
+    local low_bright=${LOW_BRIGHTNESS:-30}
+    local high_light=${HIGH_LIGHT:-500}
+    local high_bright=${HIGH_BRIGHTNESS:-100}
+    
+    if [ "$light" -le "$low_light" ]; then
+        echo "$low_bright"
+    elif [ "$light" -ge "$high_light" ]; then
+        echo "$high_bright"
+    else
+        local range=$((high_light - low_light))
+        local position=$((light - low_light))
+        local ratio=$((position * 1000 / range))
+        local brightness_range=$((high_bright - low_bright))
+        echo $((low_bright + (brightness_range * ratio / 1000)))
+    fi
+}
+
+run_daemon() {
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+    fi
+    
+    # Apply config (or defaults)
+    UPDATE_INTERVAL=${UPDATE_INTERVAL:-1}
+    SAMPLE_SIZE=${SAMPLE_SIZE:-5}
+    
+    local win_id=$(get_realdash_window)
+    if [ -z "$win_id" ]; then
+        echo "Error: RealDash window not found" >&2
+        exit 1
+    fi
+    
+    declare -a samples=()
+    local current_index=0
+    
+    # Default brightness if no sensor (100% = full brightness)
+    local default_brightness=100
+    
+    # Check if config has a constant brightness setting
+    if [ -f "$CONFIG_FILE" ] && grep -q "^CONSTANT_BRIGHTNESS=" "$CONFIG_FILE"; then
+        source "$CONFIG_FILE"
+        default_brightness=${CONSTANT_BRIGHTNESS:-100}
+    fi
+    
+    while true; do
+        if [ -f "$SENSOR_PATH" ]; then
+            # Sensor available - use auto-brightness
+            local light_raw=$(cat "$SENSOR_PATH" 2>/dev/null || echo "0")
+            
+            if [ -n "$light_raw" ] && [ "$light_raw" -gt 0 ]; then
+                local target_brightness=$(map_light_to_brightness "$light_raw")
+                
+                samples[$current_index]=$target_brightness
+                current_index=$(((current_index + 1) % SAMPLE_SIZE))
+                
+                local sum=0
+                local count=0
+                for sample in "${samples[@]}"; do
+                    if [ -n "$sample" ]; then
+                        sum=$((sum + sample))
+                        count=$((count + 1))
+                    fi
+                done
+                
+                if [ $count -gt 0 ]; then
+                    local smoothed=$((sum / count))
+                    env LC_ALL=C picom-trans -w "$win_id" -o "$smoothed" 2>/dev/null
+                fi
+            fi
+        else
+            # No sensor - use constant brightness (or default)
+            env LC_ALL=C picom-trans -w "$win_id" -o "$default_brightness" 2>/dev/null
+        fi
+        
+        sleep "$UPDATE_INTERVAL"
+    done
+}
+
+case "$1" in
+    setup)
+        setup_calibration
+        ;;
+    
+    start)
+        if pgrep -f "auto-brightness daemon" >/dev/null; then
+            echo "Already running"
+        else
+            nohup "$0" daemon > /dev/null 2>&1 &
+            echo $! > "$PID_FILE"
+            echo "Started (PID: $(cat $PID_FILE))"
+        fi
+        ;;
+    
+    stop)
+        if [ -f "$PID_FILE" ]; then
+            kill $(cat "$PID_FILE") 2>/dev/null
+            rm -f "$PID_FILE"
+        fi
+        pkill -f "auto-brightness daemon"
+        echo "Stopped"
+        ;;
+    
+    status)
+        if pgrep -f "auto-brightness daemon" >/dev/null; then
+            echo "Auto-brightness: RUNNING"
+            if [ -f "$CONFIG_FILE" ]; then
+                echo "Config:"
+                cat "$CONFIG_FILE"
+            fi
+        else
+            echo "Auto-brightness: STOPPED"
+        fi
+        ;;
+    
+    set)
+        if [ -z "$2" ]; then
+            echo "Usage: auto-brightness set <0-100>"
+            exit 1
+        fi
+        "$0" stop
+        set_brightness "$2"
+        ;;
+    
+    daemon)
+        run_daemon
+        ;;
+    
+    *)
+        echo "Usage: auto-brightness {setup|start|stop|status|set <0-100>}"
+        echo ""
+        echo "Commands:"
+        echo "  setup  - Calibrate auto-brightness (low/high points, sample rate, averaging)"
+        echo "  start  - Start auto-brightness daemon"
+        echo "  stop   - Stop auto-brightness daemon"
+        echo "  status - Show current status and config"
+        echo "  set    - Set constant brightness (stops auto)"
+        exit 1
+        ;;
+esac
+EOF
+    sudo chmod +x "$ROOTFS/usr/local/bin/auto-brightness"
+    
+    # Create service to auto-load BH1750 sensor on boot
+    sudo tee "$ROOTFS/etc/systemd/system/bh1750-sensor.service" > /dev/null << 'EOF'
+[Unit]
+Description=Load BH1750 light sensor
+After=local-fs.target
+Before=auto-brightness.service
+
+[Service]
+Type=oneshot
+# Load driver module
+ExecStart=/sbin/modprobe bh1750
+# Add sensor to I2C bus (try both common addresses)
+ExecStart=/bin/sh -c 'echo bh1750 0x23 > /sys/bus/i2c/devices/i2c-1/new_device 2>/dev/null || true'
+ExecStart=/bin/sh -c 'sleep 1; echo bh1750 0x5C > /sys/bus/i2c/devices/i2c-1/new_device 2>/dev/null || true'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable bh1750-sensor.service" 2>/dev/null || true
+    
+    # Create systemd service for auto-brightness (starts after RealDash and sensor)
+    sudo tee "$ROOTFS/etc/systemd/system/auto-brightness.service" > /dev/null << 'EOF'
+[Unit]
+Description=Auto-brightness control for RealDash
+After=realdash.service picom.service bh1750-sensor.service
+Wants=realdash.service picom.service
+DefaultDependencies=no
+
+[Service]
+Type=simple
+User=root
+Environment=HOME=/root
+Environment=DISPLAY=:0
+# Brief delay so RealDash/X is ready
+ExecStartPre=/bin/sleep 3
+ExecStart=/usr/local/bin/auto-brightness daemon
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable auto-brightness.service" 2>/dev/null || true
+    
+    # Picom systemd service: start after RealDash with DISPLAY=:0
+    sudo tee "$ROOTFS/etc/systemd/system/picom.service" > /dev/null << 'EOF'
+[Unit]
+Description=Picom compositor for RealDash opacity control
+After=realdash.service
+Wants=realdash.service
+DefaultDependencies=no
+
+[Service]
+Type=simple
+User=root
+Environment=HOME=/root
+Environment=DISPLAY=:0
+# Brief delay so RealDash/X is ready
+ExecStartPre=/bin/sleep 2
+ExecStart=/usr/bin/picom --config /root/.config/picom/picom.conf
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable picom.service" 2>/dev/null || true
+    
+    echo "✓ Picom configured for RealDash opacity control"
+    echo "  - Config: /root/.config/picom/picom.conf"
+    echo "  - Manual control: set-realdash-opacity <0-100>"
+    echo "  - Auto-brightness: auto-brightness {setup|start|stop|status|set <0-100>}"
+    echo "  - Picom auto-starts after RealDash (picom.service)"
+    echo "  - BH1750 sensor auto-loads on boot (bh1750-sensor.service)"
+    echo "  - Auto-brightness auto-starts after RealDash (auto-brightness.service)"
+    
+    # Configure services to start AFTER RealDash (deferred startup for faster boot)
+    echo "=== 7d. Configuring deferred service startup (after RealDash) ==="
+    
+    # Create post-realdash service to batch-start non-critical services
+    sudo tee "$ROOTFS/etc/systemd/system/post-realdash.service" > /dev/null << 'EOF'
+[Unit]
+Description=Start non-critical services after RealDash
+After=realdash.service
+Wants=realdash.service
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+# Start these services after RealDash is running
+ExecStart=/bin/sh -c 'systemctl start systemd-networkd systemd-resolved ssh 2>/dev/null || true'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable post-realdash.service" 2>/dev/null || true
+    
+    # NOTE: We intentionally do NOT add "After=realdash.service" drop-ins to system units like
+    # systemd-networkd/systemd-resolved. That can create ordering cycles during early boot.
+    # Instead, we simply start them from post-realdash.service.
+    
+    # Configure journald for volatile storage (faster boot, no flush delay)
+    sudo mkdir -p "$ROOTFS/etc/systemd/journald.conf.d"
+    sudo tee "$ROOTFS/etc/systemd/journald.conf.d/fastboot.conf" > /dev/null << 'EOF'
+[Journal]
+Storage=volatile
+EOF
+    echo "✓ Services configured to start after RealDash"
+else
+    echo "Skipping Xorg/RealDash setup (console-only mode)"
+fi
+
 echo "=== 8. Assembling Final Image ==="
 BOOT_DIR="$BUILD_DIR/boot_partition"
 mkdir -p "$BOOT_DIR"
@@ -416,7 +1111,7 @@ cp "$SOURCES_DIR/linux/arch/arm64/boot/Image" "$BOOT_DIR/kernel8.img"
 
 # Create config.txt - boot directly with RPi bootloader (faster than U-Boot, works with USB)
 # U-Boot has incomplete USB support on RPi5, so we use native bootloader
-cat << 'EOF' > "$BOOT_DIR/config.txt"
+cat << EOF > "$BOOT_DIR/config.txt"
 arm_64bit=1
 device_tree=bcm2712-rpi-5-b.dtb
 kernel=kernel8.img
@@ -435,7 +1130,7 @@ dtoverlay=i2c1
 
 # Enable SPI and MCP2515 CAN bus controller
 dtoverlay=spi
-dtoverlay=mcp2515-can0,oscillator=16000000,interrupt=25
+dtoverlay=mcp2515-can0,oscillator=${CAN_OSCILLATOR_FREQ},interrupt=25
 
 # Force HDMI hotplug (skip detection wait, but allow EDID for auto-resolution)
 hdmi_force_hotplug=1
@@ -457,6 +1152,11 @@ usb_max_current_enable=1
 # Disable under-voltage warnings (power supply warning during shutdown)
 # Note: Pi5 doesn't fully power off - enters low-power state by design
 avoid_warnings=1
+
+# Overclock settings
+arm_freq=2800
+gpu_freq=1000
+over_voltage=4
 EOF
 
 # Create cmdline.txt for kernel parameters

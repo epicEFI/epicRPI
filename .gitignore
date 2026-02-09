@@ -1,0 +1,4 @@
+/boot_partition
+/rootfs
+/sources
+*.img

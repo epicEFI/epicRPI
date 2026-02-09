@@ -2,15 +2,60 @@
 
 Scripts for setting up fast booting raspberry pi (target:5) for dashboard purposes
 
-not to be confused with pidash
-#
-u: root
+## hardware
 
-pw: raspberry
+The images are built from kernel up for specific hardware. It is imperative that the hardware is exactly the same, especially if preocmpiled images are being used
 
-run the script in wsl, flash the resulting image with rufus
+[Raspberry Pi 5 8GB](https://a.co/d/7jMadcG)
 
-systemctl start ssh
+[Raspberry Pi 5 Heatsink](https://a.co/d/elmmdVK)
 
-you are sudo, sudo doesn't exist
+[12v to 5v dc-dc converter](https://a.co/d/00Z0rZ2)
 
+[Transcend ESD310 usb SSD](https://a.co/d/exShsKE)
+
+[mcp2515 raspberry pi hat](https://a.co/d/3NRXKm7)
+
+[BH1750 light sensor](https://a.co/d/2t3qrWY)
+
+MIPI-DSI or HDMI display fitting your application
+
+## install
+
+### precompiled image
+
+placeholder
+
+### build your own
+
+in wsl:
+
+git clone github.com/epicefi/epicrpi
+
+for realdash run:
+
+```bash
+
+./build_rpi5_fastboot.sh
+
+```
+
+for console only image run:
+
+```bash
+
+./console_only_build/build_rpi_fastboot.sh
+
+```
+
+to configure auto brightess, hit ctrl-F2 to enter TTY2 console on your connected display
+
+U: root
+
+PW: raspberry
+
+```bash
+
+auto-brightness setup
+
+```
