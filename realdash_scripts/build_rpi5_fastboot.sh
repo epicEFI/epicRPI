@@ -172,9 +172,11 @@ deb [signed-by=/usr/share/keyrings/raspberrypi-archive-keyring.gpg] http://archi
 EOF
 
 # Install Raspberry Pi Foundation packages (rpi-eeprom, raspi-config) now that repo is configured
+# Note: RPi archive key still uses SHA1 in signatures; Debian rejects SHA1 as of 2026-02-01.
+# Allow insecure repo for this step until RPi Foundation publishes an updated key.
 echo "=== 7a. Installing Raspberry Pi Foundation Packages ==="
-sudo chroot "$ROOTFS" /bin/bash -c "apt-get update" 2>&1
-sudo chroot "$ROOTFS" /bin/bash -c "apt-get install -y rpi-eeprom raspi-config" 2>&1 || echo "Warning: Could not install rpi-eeprom/raspi-config (may need manual install after boot)"
+sudo chroot "$ROOTFS" /bin/bash -c "apt-get update -o Acquire::AllowInsecureRepositories=true -o Acquire::AllowDowngradeToInsecureRepositories=true" 2>&1
+sudo chroot "$ROOTFS" /bin/bash -c "apt-get install -y -o Acquire::AllowInsecureRepositories=true rpi-eeprom raspi-config" 2>&1 || echo "Warning: Could not install rpi-eeprom/raspi-config (may need manual install after boot)"
 
 # Configure EEPROM boot order to prioritize USB (0xf14 = USB, then SD, then network)
 # This improves boot times by scanning USB first
@@ -435,7 +437,7 @@ dtoverlay=i2c1
 
 # Enable SPI and MCP2515 CAN bus controller
 dtoverlay=spi
-dtoverlay=mcp2515-can0,oscillator=16000000,interrupt=25
+dtoverlay=mcp2515-can0,oscillator=12000000,interrupt=25
 
 # Force HDMI hotplug (skip detection wait, but allow EDID for auto-resolution)
 hdmi_force_hotplug=1
