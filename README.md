@@ -10,6 +10,8 @@ The images are built from kernel up for specific hardware. It is imperative that
 
 MIPI-DSI or HDMI display fitting your application. See [Adding your own MIPI display](#adding-your-own-mipi-display) below.
 
+**USB keyboard and mouse** — required for first-time setup (WiFi, loading dashboards) and for RealDash edit mode. Touch alone is not enough for initial config.
+
 ## install
 
 ### precompiled image
@@ -52,6 +54,8 @@ For console-only image:
 
 > **WSL tip:** The build script sets `DEBIAN_FRONTEND=noninteractive` so apt/gpg don’t prompt mid-run. For fewer sudo password prompts in WSL: `echo 'Defaults timestamp_timeout=480' | sudo tee /etc/sudoers.d/timeout && sudo chmod 440 /etc/sudoers.d/timeout`
 
+**Clock:** Pi 5 has no battery RTC. The image is stamped with build time (`fake-hwclock`) and syncs via NTP once ethernet is up (`systemd-timesyncd`). No manual date step needed if the Pi gets network early — apt works after a few seconds on DHCP.
+
 ## SSH access
 
 SSH is enabled with root login. Default credentials:
@@ -73,6 +77,110 @@ To find the Pi's IP, either:
 
 > **Note:** Root password login is enabled for convenience. For production, change the password with `passwd` and consider disabling root SSH or using key-based auth. SSH may be disabled at boot on some builds — start it with `systemctl start ssh` if needed.
 
+## First boot — what you need
+
+The Pi is meant to run headless in the car, but **first-time setup needs input and usually wired network**:
+
+| Need | Why |
+|------|-----|
+| **USB keyboard** | RealDash has no on-screen keyboard; WiFi setup on tty2, VT switch (**Ctrl+Alt+F2**), and RealDash edit mode all need keys |
+| **USB mouse** (recommended) | Easier than touch alone for RealDash menus, gallery, and dashboard editing |
+| **Ethernet cable** (recommended first boot) | Sets clock via NTP, lets you SSH from a laptop, and is the easiest way to run `wifi-setup` before you unplug and mount in the car |
+
+**Typical flow:** flash image → plug **keyboard + mouse + ethernet** → boot → **Ctrl+Alt+F2** → `wifi-setup "SSID" "password"` → confirm `wlan0` has an IP → unplug ethernet if you want WiFi-only → mount in vehicle.
+
+Touch works on supported DSI panels after RealDash starts, but plan on a keyboard at least once for WiFi and dashboard loading.
+
+## WiFi
+
+New images ship with WiFi enabled (firmware + `wpa_supplicant` + `systemd-networkd` for `wlan0`). Bluetooth stays off.
+
+### Connect (new image)
+
+1. Boot with **ethernet plugged in** (wait ~10 s for DHCP and NTP).
+2. Press **Ctrl+Alt+F2** for a root shell (fish).
+3. Run:
+
+```bash
+wifi-setup "YOUR_SSID" "YOUR_PASSWORD"
+ip addr show wlan0
+ping -c 2 1.1.1.1
+```
+
+4. Optional: unplug ethernet and confirm WiFi still works after `ping -c 2 1.1.1.1`.
+
+**Verify radio is up:**
+
+```bash
+ip link show wlan0
+timedatectl          # clock synced? needed for apt
+dmesg | grep brcmfmac
+```
+
+**Change network later:** run `wifi-setup` again with the new SSID/password, or edit `/etc/wpa_supplicant/wpa_supplicant-wlan0.conf` and `systemctl restart wpa_supplicant@wlan0`.
+
+**No ethernet?** You can do everything on tty2 with keyboard + display: same `wifi-setup` command. Without any network on first boot, the clock may be wrong and apt can fail — plug ethernet briefly or run `date -s "YYYY-MM-DD HH:MM:SS"` before apt.
+
+### SSH over WiFi
+
+Once `wlan0` has an IP, from your laptop:
+
+```bash
+ssh root@<wlan-ip>
+# or if mDNS works:
+ssh root@raspberrypi.local
+```
+
+Default password: `raspberry`. SSH may need `systemctl start ssh` on some builds.
+
+### Older image (WiFi was disabled at build time)
+
+Run as root (fish-safe). Needs ethernet or a display once for the first setup.
+
+```fish
+# 1) Enable WiFi in boot config (comment out disable-wifi)
+sed -i 's/^dtoverlay=disable-wifi/# dtoverlay=disable-wifi/' /boot/config.txt
+
+# 2) Stop blacklisting the WiFi modules (keep BT blacklisted if you want)
+rm -f /etc/modprobe.d/disable-wifi-bt.conf
+printf '%s\n' 'blacklist bluetooth' 'blacklist btbcm' 'blacklist hci_uart' > /etc/modprobe.d/disable-bt.conf
+
+# 3) Clock must be roughly correct or apt signature checks fail (new images: skip if timedatectl shows synced)
+date
+# only if wrong:
+# date -s "2026-07-21 12:00:00"
+
+# 4) RPi apt repo often fails SHA1 policy — disable it for this install
+mv /etc/apt/sources.list.d/raspberrypi.list /etc/apt/sources.list.d/raspberrypi.list.disabled 2>/dev/null
+
+# 5) Install firmware + client
+apt-get update
+apt-get install -y --allow-unauthenticated firmware-brcm80211 wireless-regdb iw wpasupplicant
+
+# 6) DHCP for wlan0
+printf '%s\n' '[Match]' 'Name=wlan0' '' '[Network]' 'DHCP=yes' > /etc/systemd/network/25-wlan.network
+
+# 7) Reboot so the SDIO chip loads firmware cleanly
+systemctl reboot
+```
+
+After reboot:
+
+```fish
+# confirm radio
+dmesg | grep brcmfmac
+ip link show wlan0
+
+# associate (replace SSID/password)
+wpa_passphrase "YOUR_SSID" "YOUR_PASSWORD" > /etc/wpa_supplicant/wpa_supplicant-wlan0.conf
+chmod 600 /etc/wpa_supplicant/wpa_supplicant-wlan0.conf
+systemctl enable --now wpa_supplicant@wlan0
+networkctl reload
+networkctl up wlan0
+ip addr show wlan0
+ping -c 2 1.1.1.1
+```
+
 ## TTY consoles
 
 You can switch between virtual consoles on the attached display using **Ctrl+Alt+Fn**:
@@ -93,6 +201,70 @@ auto-brightness setup
 ```
 
 > **VT switch note:** Do **not** put `video=DSI-*:...rotate=` or `fbcon=rotate` in `/boot/cmdline.txt` when RealDash/Xorg runs on the same DSI. Kernel fb rotation freezes tty2 on a snapshot of tty1. Leave cmdline without rotate; landscape is done in X only (see below). tty2 stays portrait — use SSH when you want a landscape shell.
+
+## RealDash
+
+RealDash starts automatically on **tty1** at boot (`realdash.service`). Full manuals: **[RealDash Manuals & Tutorials](https://realdash.net/manuals.php)** — keyboard shortcuts: **[Keyboard Shortcuts](https://realdash.net/manuals/keyboard_shortcuts.php)**.
+
+### Getting a dashboard on screen
+
+1. Boot with **keyboard + mouse** (and ethernet for first-time WiFi).
+2. RealDash opens on the MIPI/HDMI display (tty1).
+3. **Shift+1** → Gallery → pick or download a dashboard (needs network for new downloads).
+4. **Ctrl+O** → load a `.rdash` file from disk (edit mode).
+5. **Ctrl+S** → save changes.
+
+Dashboard files live under RealDash’s data directory (typically `/root/.local/share/RealDash/` or paths shown in RealDash **Settings**). Use a USB stick or SCP over SSH to copy `.rdash` files onto the Pi.
+
+### Keyboard shortcuts (most used on the Pi)
+
+**Run mode** (normal driving / display):
+
+| Keys | Action |
+|------|--------|
+| **Arrow keys** | Switch dashboard pages |
+| **Space** | Show / hide top menu |
+| **Shift+1** | Gallery |
+| **Shift+2** | Dyno |
+| **Shift+3** | Log viewer |
+| **Shift+4** | Profiles |
+| **Shift+5** | Settings |
+| **Shift+6** | Enter edit mode |
+| **1–9** | Emulate steering-wheel buttons 1–9 |
+| **F2** | Reboot RealDash app |
+| **F4** | Fullscreen (desktop) |
+| **F9** | Screenshot to gallery |
+
+**Edit mode** (layout / gauges — use keyboard + mouse):
+
+| Keys | Action |
+|------|--------|
+| **Ctrl+O** | Load dashboard |
+| **Ctrl+S** | Save dashboard |
+| **Ctrl+W** | Toggle hide all menus |
+| **Ctrl+E** | Toggle edit bar |
+| **Ctrl+R** | Rename |
+| **Shift+7** | Exit edit mode |
+| **Arrow keys** | Move selected gauges |
+| **Del** | Delete selected gauges |
+
+More shortcuts (align, scale, paste, etc.): [realdash.net/manuals/keyboard_shortcuts.php](https://realdash.net/manuals/keyboard_shortcuts.php)
+
+### System commands (shell / SSH)
+
+Run these from **Ctrl+Alt+F2**, SSH, or any tty except while typing inside RealDash:
+
+```bash
+systemctl status realdash    # is RealDash/X running?
+systemctl restart realdash   # restart dashboard (fixes many glitches)
+reboot                       # full Pi reboot (/usr/local/bin/reboot → systemctl)
+poweroff                     # shut down
+
+# optional — if auto-brightness package is installed
+auto-brightness setup
+```
+
+RealDash CAN, adapters, target IDs, multicast, etc.: see the [RealDash manuals index](https://realdash.net/manuals.php).
 
 ## Working Waveshare 12.3" + RealDash (verified)
 
@@ -193,9 +365,9 @@ Before changing the build script, enable the panel on the running Pi:
 
 4. **Reboot** (use one that works on your system):
    ```bash
-   sudo reboot
-   ```
-   If that fails, try: `systemctl reboot` or `sudo shutdown -r now`
+   systemctl reboot
+```
+   If that fails, try: `reboot` (works on images with `systemd-sysv`) or `shutdown -r now`
 
 5. **If the screen is still blank**, use the checks below.
 

@@ -175,7 +175,7 @@ if [[ "$SKIP_ROOTFS" == "false" ]]; then
         sudo rm -rf "$BUILD_DIR/rootfs"
         mkdir -p "$BUILD_DIR/rootfs"
         sudo debootstrap --arch=arm64 --variant=minbase \
-            --include=labwc,seatd,libseat1,busybox,kmod,udev,fish,systemd,dbus,libgl1-mesa-dri,mesa-vulkan-drivers,libwayland-client0,libwayland-server0,libegl1,libgles2,libicu76,iproute2,iputils-ping,nano,openssh-server,wget,gnupg,systemd-resolved,can-utils,xserver-xorg-core,xserver-xorg,xinit,xauth,xserver-xorg-input-libinput,x11-xserver-utils,x11-utils,xinput,unclutter \
+            --include=labwc,seatd,libseat1,busybox,kmod,udev,fish,systemd,systemd-sysv,systemd-timesyncd,fake-hwclock,dbus,libgl1-mesa-dri,mesa-vulkan-drivers,libwayland-client0,libwayland-server0,libegl1,libgles2,libicu76,iproute2,iputils-ping,nano,openssh-server,wget,gnupg,systemd-resolved,can-utils,firmware-brcm80211,wireless-regdb,iw,wpasupplicant,xserver-xorg-core,xserver-xorg,xinit,xauth,xserver-xorg-input-libinput,x11-xserver-utils,x11-utils,xinput,unclutter \
             trixie "$BUILD_DIR/rootfs" http://deb.debian.org/debian
     else
         echo "RootFS already exists, skipping debootstrap (delete rootfs dir to rebuild)"
@@ -221,6 +221,29 @@ sudo chroot "$ROOTFS" /bin/bash -c "export DEBIAN_FRONTEND=noninteractive; apt-g
 
 # Ensure Xorg launcher pieces exist (some images end up missing xinit even if Xorg is present)
 sudo chroot "$ROOTFS" /bin/bash -c "export DEBIAN_FRONTEND=noninteractive; apt-get install -y xinit x11-xserver-utils xinput unclutter" 2>&1 || echo "Warning: Could not install xinit/xinput (may need manual install after boot)"
+
+# WiFi: brcmfmac firmware + wpa_supplicant (from Debian non-free-firmware / main)
+# Drivers ship with the kernel; without firmware-brcm80211, wlan0 never appears.
+# systemd-sysv provides /sbin/reboot|/sbin/poweroff that talk to systemd
+# (busybox reboot alone does not work reliably on this image).
+echo "=== 7a.2 Installing WiFi firmware, clients, and systemd-sysv ==="
+sudo chroot "$ROOTFS" /bin/bash -c "
+  export DEBIAN_FRONTEND=noninteractive
+  mv /etc/apt/sources.list.d/raspberrypi.list /etc/apt/sources.list.d/raspberrypi.list.disabled 2>/dev/null || true
+  apt-get update
+  apt-get install -y --allow-unauthenticated firmware-brcm80211 wireless-regdb iw wpasupplicant systemd-timesyncd systemd-sysv fake-hwclock
+" 2>&1 || echo "Warning: Could not install WiFi/systemd-sysv packages (may need manual install after boot)"
+sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable systemd-timesyncd fake-hwclock" 2>/dev/null || true
+
+# Pi 5 has no battery-backed RTC — seed clock at build time, then NTP over ethernet refines it
+echo "=== 7a.3 Seeding system clock ==="
+BUILD_TIME=$(date -u +%Y-%m-%d\ %H:%M:%S)
+sudo tee "$ROOTFS/etc/systemd/timesyncd.conf" > /dev/null << 'EOF'
+[Time]
+NTP=0.debian.pool.ntp.org 1.debian.pool.ntp.org time.google.com
+FallbackNTP=time.cloudflare.com
+EOF
+sudo chroot "$ROOTFS" /bin/bash -c "date -s '$BUILD_TIME' && fake-hwclock save force 2>/dev/null || fake-hwclock save 2>/dev/null || true"
 
 # Install RealDash .deb into the image (if present)
 echo "=== 7a.1 Installing RealDash (local .deb) ==="
@@ -302,17 +325,16 @@ sudo tee "$ROOTFS/etc/modules-load.d/bh1750.conf" > /dev/null << 'EOF'
 bh1750
 EOF
 
-# Blacklist Bluetooth and WiFi modules to prevent loading
+# Blacklist Bluetooth only (WiFi stays enabled; BT still off via dtoverlay=disable-bt)
 sudo mkdir -p "$ROOTFS/etc/modprobe.d"
-sudo tee "$ROOTFS/etc/modprobe.d/disable-wifi-bt.conf" > /dev/null << 'EOF'
-blacklist brcmfmac
-blacklist brcmutil
+sudo rm -f "$ROOTFS/etc/modprobe.d/disable-wifi-bt.conf"
+sudo tee "$ROOTFS/etc/modprobe.d/disable-bt.conf" > /dev/null << 'EOF'
 blacklist bluetooth
 blacklist btbcm
 blacklist hci_uart
 EOF
 
-# Configure systemd-networkd for ethernet DHCP
+# Configure systemd-networkd for ethernet + WiFi DHCP
 # Pi5 uses "end0" interface name (predictable interface naming)
 sudo mkdir -p "$ROOTFS/etc/systemd/network"
 sudo tee "$ROOTFS/etc/systemd/network/20-ethernet.network" > /dev/null << 'EOF'
@@ -323,6 +345,47 @@ Name=en*
 DHCP=yes
 DNS=8.8.8.8 8.8.4.4 1.1.1.1
 EOF
+
+sudo tee "$ROOTFS/etc/systemd/network/25-wlan.network" > /dev/null << 'EOF'
+[Match]
+Name=wlan0
+
+[Network]
+DHCP=yes
+DNS=8.8.8.8 8.8.4.4 1.1.1.1
+EOF
+
+# Helper: wifi-setup "SSID" "password"  (creates wpa_supplicant@wlan0 and starts it)
+sudo tee "$ROOTFS/usr/local/bin/wifi-setup" > /dev/null << 'EOF'
+#!/bin/bash
+set -euo pipefail
+if [[ $# -lt 2 ]]; then
+  echo "Usage: wifi-setup \"SSID\" \"password\""
+  exit 1
+fi
+SSID=$1
+PASS=$2
+mkdir -p /etc/wpa_supplicant
+wpa_passphrase "$SSID" "$PASS" > /etc/wpa_supplicant/wpa_supplicant-wlan0.conf
+chmod 600 /etc/wpa_supplicant/wpa_supplicant-wlan0.conf
+systemctl enable wpa_supplicant@wlan0
+systemctl restart wpa_supplicant@wlan0
+networkctl reload 2>/dev/null || true
+networkctl up wlan0 2>/dev/null || true
+echo "WiFi configured for SSID=$SSID — check: ip addr show wlan0"
+EOF
+sudo chmod +x "$ROOTFS/usr/local/bin/wifi-setup"
+
+# reboot/poweroff in /usr/local/bin — fish PATH often omits /sbin
+sudo tee "$ROOTFS/usr/local/bin/reboot" > /dev/null << 'EOF'
+#!/bin/sh
+exec systemctl reboot "$@"
+EOF
+sudo tee "$ROOTFS/usr/local/bin/poweroff" > /dev/null << 'EOF'
+#!/bin/sh
+exec systemctl poweroff "$@"
+EOF
+sudo chmod +x "$ROOTFS/usr/local/bin/reboot" "$ROOTFS/usr/local/bin/poweroff"
 
 # Configure systemd-resolved for DNS resolution
 sudo mkdir -p "$ROOTFS/etc/systemd"
@@ -622,9 +685,8 @@ boot_delay=0
 dtoverlay=vc4-kms-v3d-pi5
 dtoverlay=vc4-kms-dsi-waveshare-panel-v2,12_3_inch_a_4lane
 
-# Disable Bluetooth and WiFi
+# Disable Bluetooth only (WiFi enabled — needs firmware-brcm80211 in rootfs)
 dtoverlay=disable-bt
-dtoverlay=disable-wifi
 
 # Enable I2C interface (matches raspi-config behavior)
 dtoverlay=i2c1
