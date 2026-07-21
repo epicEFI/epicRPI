@@ -5,6 +5,13 @@
 
 set -e
 
+# Non-interactive apt/dpkg (no y/N mid-script)
+export DEBIAN_FRONTEND=noninteractive
+export APT_LISTCHANGES_FRONTEND=none
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REALDASH_DEB="$SCRIPT_DIR/../realdash-mrd_2.6.2-1_arm64.deb"
+
 # Configuration
 BUILD_DIR="$HOME/rpi5-fastboot"
 SOURCES_DIR="$BUILD_DIR/sources"
@@ -13,6 +20,10 @@ IMG_NAME="rpi5-fastboot.img"
 CONSOLE_ONLY=false
 SKIP_KERNEL=false
 SKIP_ROOTFS=false
+# Waveshare 12.3" native mode is 720x1920 (portrait). Dashboard mount uses landscape via xrandr.
+# Do NOT use video= or fbcon= rotate in cmdline — breaks VT switch when Xorg runs on the same DSI.
+DSI_CONNECTOR="${DSI_CONNECTOR:-DSI-2}"
+XRANDR_ROTATE="${XRANDR_ROTATE:-left}"
 
 # Parse arguments
 for arg in "$@"; do
@@ -34,11 +45,15 @@ for arg in "$@"; do
             SKIP_ROOTFS=true
             echo "[OPT] Quick mode: skipping kernel and rootfs builds"
             ;;
+        --rotate=*)
+            XRANDR_ROTATE="${arg#*=}"
+            echo "[OPT] xrandr rotate=$XRANDR_ROTATE"
+            ;;
     esac
 done
 
 echo "=== 1. Installing System Dependencies ==="
-sudo apt-get update
+sudo apt-get update -y
 sudo apt-get install -y \
     bc build-essential flex bison libssl-dev libncurses5-dev libncursesw5-dev \
     gawk git make python3 python3-dev python3-setuptools swig libpython3-dev \
@@ -55,21 +70,38 @@ mkdir -p "$WINDOWS_WORKSPACE"
 cd "$SOURCES_DIR"
 
 echo "=== 3. Cloning Repositories (Shallow) ==="
-[ ! -d "linux" ] && git clone --depth 1 https://github.com/raspberrypi/linux.git
+# rpi-6.12.y required for Waveshare 12.3" DSI: waveshare-dsi V2 + waveshare_touchscreen
+# (panel + backlight at 0x45, Goodix at 0x5d). Older trees (e.g. rpi-6.6.y) only have
+# panel-simple / v1 overlay support and leave the 12.3" blank.
+KERNEL_BRANCH="rpi-6.12.y"
+if [ -d "linux" ]; then
+    CURRENT_BRANCH=$(git -C linux rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+    if [ "$CURRENT_BRANCH" != "$KERNEL_BRANCH" ]; then
+        echo "[WARN] linux is on '$CURRENT_BRANCH', need '$KERNEL_BRANCH' for Waveshare 12.3\" — recloning"
+        rm -rf linux
+    fi
+fi
+[ ! -d "linux" ] && git clone --depth 1 -b "$KERNEL_BRANCH" https://github.com/raspberrypi/linux.git
 [ ! -d "firmware" ] && git clone --depth 1 https://github.com/raspberrypi/firmware.git
 
 echo "=== 4. Building Linux Kernel ==="
 if [[ "$SKIP_KERNEL" == "false" ]]; then
     cd "$SOURCES_DIR/linux"
-    if [ ! -f "arch/arm64/boot/Image" ]; then
+    # Force rebuild if Image is missing OR tree is not on the required branch
+    CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+    if [ ! -f "arch/arm64/boot/Image" ] || [ "$CURRENT_BRANCH" != "$KERNEL_BRANCH" ]; then
+        if [ -f "arch/arm64/boot/Image" ] && [ "$CURRENT_BRANCH" != "$KERNEL_BRANCH" ]; then
+            echo "[WARN] Stale kernel Image from wrong branch — rebuilding for $KERNEL_BRANCH"
+            rm -f arch/arm64/boot/Image
+        fi
         # Start fresh with defconfig - bcm2712_defconfig should have all Pi5 drivers
         make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- bcm2712_defconfig
         
         # Pi5 display architecture:
         # - card0 = v3d (3D rendering)
         # - card1 = vc4/axi:gpu (main display controller with HDMI)
-        # - card2 = RP1 DPI (optional)
-        # We need vc4 built-in (=y) not as module (=m) for reliable HDMI
+        # - card2 = RP1 DSI / DPI
+        # We need vc4 + RP1 DSI + Waveshare V2 built-in (=y) for reliable early display
         ./scripts/config --enable CONFIG_DRM
         ./scripts/config --set-val CONFIG_DRM_V3D y
         ./scripts/config --set-val CONFIG_DRM_VC4 y
@@ -80,6 +112,14 @@ if [[ "$SKIP_KERNEL" == "false" ]]; then
         ./scripts/config --enable CONFIG_DRM_FBDEV_EMULATION
         ./scripts/config --enable CONFIG_FB
         ./scripts/config --enable CONFIG_FRAMEBUFFER_CONSOLE
+        # Waveshare 12.3" DSI-TOUCH (v2) — required by dtoverlay=vc4-kms-dsi-waveshare-panel-v2
+        ./scripts/config --set-val CONFIG_DRM_RP1_DSI y
+        ./scripts/config --set-val CONFIG_DRM_PANEL_SIMPLE y
+        ./scripts/config --set-val CONFIG_DRM_PANEL_WAVESHARE_TOUCHSCREEN y
+        ./scripts/config --set-val CONFIG_DRM_PANEL_WAVESHARE_TOUCHSCREEN_V2 y
+        ./scripts/config --set-val CONFIG_REGULATOR_WAVESHARE_TOUCHSCREEN y
+        ./scripts/config --set-val CONFIG_TOUCHSCREEN_GOODIX y
+        ./scripts/config --enable CONFIG_BACKLIGHT_CLASS_DEVICE
         # Disable debug features for faster boot and smaller kernel
         ./scripts/config --disable CONFIG_DEBUG_INFO
         ./scripts/config --disable CONFIG_DEBUG_KERNEL
@@ -123,7 +163,7 @@ if [[ "$SKIP_KERNEL" == "false" ]]; then
         make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
         make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image modules dtbs
     else
-        echo "Kernel already built, skipping (delete arch/arm64/boot/Image to rebuild)"
+        echo "Kernel already built on $KERNEL_BRANCH, skipping (delete arch/arm64/boot/Image to rebuild)"
     fi
 else
     echo "Skipping kernel build as requested"
@@ -135,7 +175,7 @@ if [[ "$SKIP_ROOTFS" == "false" ]]; then
         sudo rm -rf "$BUILD_DIR/rootfs"
         mkdir -p "$BUILD_DIR/rootfs"
         sudo debootstrap --arch=arm64 --variant=minbase \
-            --include=labwc,seatd,libseat1,busybox,kmod,udev,fish,systemd,dbus,libgl1-mesa-dri,mesa-vulkan-drivers,libwayland-client0,libwayland-server0,libegl1,libgles2,libicu76,iproute2,iputils-ping,nano,openssh-server,wget,gnupg,systemd-resolved,can-utils \
+            --include=labwc,seatd,libseat1,busybox,kmod,udev,fish,systemd,dbus,libgl1-mesa-dri,mesa-vulkan-drivers,libwayland-client0,libwayland-server0,libegl1,libgles2,libicu76,iproute2,iputils-ping,nano,openssh-server,wget,gnupg,systemd-resolved,can-utils,xserver-xorg-core,xserver-xorg,xinit,xauth,xserver-xorg-input-libinput,x11-xserver-utils,x11-utils,xinput,unclutter \
             trixie "$BUILD_DIR/rootfs" http://deb.debian.org/debian
     else
         echo "RootFS already exists, skipping debootstrap (delete rootfs dir to rebuild)"
@@ -155,8 +195,9 @@ ROOTFS="$BUILD_DIR/rootfs"
 # Use bookworm (stable) as Raspberry Pi repos may not have all Debian versions
 sudo mkdir -p "$ROOTFS/etc/apt/sources.list.d"
 sudo mkdir -p "$ROOTFS/usr/share/keyrings"
-# Download GPG key
-sudo wget -q -O - https://archive.raspberrypi.org/debian/raspberrypi.gpg.key | sudo gpg --dearmor -o "$ROOTFS/usr/share/keyrings/raspberrypi-archive-keyring.gpg"
+# Download GPG key (--batch --yes avoids interactive "Overwrite?" prompt on rebuilds)
+sudo rm -f "$ROOTFS/usr/share/keyrings/raspberrypi-archive-keyring.gpg"
+sudo wget -q -O - https://archive.raspberrypi.org/debian/raspberrypi.gpg.key | sudo gpg --batch --yes --dearmor -o "$ROOTFS/usr/share/keyrings/raspberrypi-archive-keyring.gpg"
 
 # Configure main Debian sources with all components (main, contrib, non-free, non-free-firmware)
 # Note: "universe multiverse restricted" are Ubuntu terms; Debian uses "main contrib non-free"
@@ -175,8 +216,22 @@ EOF
 # Note: RPi archive key still uses SHA1 in signatures; Debian rejects SHA1 as of 2026-02-01.
 # Allow insecure repo for this step until RPi Foundation publishes an updated key.
 echo "=== 7a. Installing Raspberry Pi Foundation Packages ==="
-sudo chroot "$ROOTFS" /bin/bash -c "apt-get update -o Acquire::AllowInsecureRepositories=true -o Acquire::AllowDowngradeToInsecureRepositories=true" 2>&1
-sudo chroot "$ROOTFS" /bin/bash -c "apt-get install -y -o Acquire::AllowInsecureRepositories=true rpi-eeprom raspi-config" 2>&1 || echo "Warning: Could not install rpi-eeprom/raspi-config (may need manual install after boot)"
+sudo chroot "$ROOTFS" /bin/bash -c "export DEBIAN_FRONTEND=noninteractive; apt-get update -o Acquire::AllowInsecureRepositories=true -o Acquire::AllowDowngradeToInsecureRepositories=true" 2>&1
+sudo chroot "$ROOTFS" /bin/bash -c "export DEBIAN_FRONTEND=noninteractive; apt-get install -y -o Acquire::AllowInsecureRepositories=true -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold rpi-eeprom raspi-config" 2>&1 || echo "Warning: Could not install rpi-eeprom/raspi-config (may need manual install after boot)"
+
+# Ensure Xorg launcher pieces exist (some images end up missing xinit even if Xorg is present)
+sudo chroot "$ROOTFS" /bin/bash -c "export DEBIAN_FRONTEND=noninteractive; apt-get install -y xinit x11-xserver-utils xinput unclutter" 2>&1 || echo "Warning: Could not install xinit/xinput (may need manual install after boot)"
+
+# Install RealDash .deb into the image (if present)
+echo "=== 7a.1 Installing RealDash (local .deb) ==="
+if [[ -f "$REALDASH_DEB" ]]; then
+    sudo mkdir -p "$ROOTFS/tmp"
+    sudo cp "$REALDASH_DEB" "$ROOTFS/tmp/"
+    sudo chroot "$ROOTFS" /bin/bash -c "export DEBIAN_FRONTEND=noninteractive; dpkg -i /tmp/$(basename "$REALDASH_DEB") || apt-get -y -f install" 2>&1
+    sudo rm -f "$ROOTFS/tmp/$(basename "$REALDASH_DEB")"
+else
+    echo "Warning: RealDash .deb not found at $REALDASH_DEB (skipping install)"
+fi
 
 # Configure EEPROM boot order to prioritize USB (0xf14 = USB, then SD, then network)
 # This improves boot times by scanning USB first
@@ -319,39 +374,38 @@ if ! grep -q "PermitRootLogin" "$ROOTFS/etc/ssh/sshd_config"; then
     echo "PermitRootLogin yes" | sudo tee -a "$ROOTFS/etc/ssh/sshd_config" > /dev/null
 fi
 
-# Auto-login on tty1
-sudo mkdir -p "$ROOTFS/etc/systemd/system/getty@tty1.service.d/"
-sudo tee "$ROOTFS/etc/systemd/system/getty@tty1.service.d/override.conf" > /dev/null << 'EOF'
+# Auto-login on tty2 (tty1 is used by RealDash/Xorg when not console-only)
+sudo mkdir -p "$ROOTFS/etc/systemd/system/getty@tty2.service.d/"
+sudo tee "$ROOTFS/etc/systemd/system/getty@tty2.service.d/override.conf" > /dev/null << 'EOF'
 [Service]
 ExecStart=
 ExecStart=-/sbin/agetty --autologin root --noclear %I $TERM
 Type=idle
 EOF
+sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable getty@tty2.service" 2>/dev/null || true
 
-# Fish config for auto-start labwc/Wayland (only if not console-only mode)
+# Fish config — shells on tty2+ only (RealDash/Xorg owns tty1 via systemd)
 sudo mkdir -p "$ROOTFS/root/.config/fish"
-sudo mkdir -p "$ROOTFS/root/.config/labwc"
 
 if [[ "$CONSOLE_ONLY" == "false" ]]; then
     sudo tee "$ROOTFS/root/.config/fish/config.fish" > /dev/null << 'EOF'
 # Clear any inherited environment variables from build
 set -e DISPLAY
 set -e WAYLAND_DISPLAY
-
-if test (tty) = "/dev/tty1"
-    # Start labwc (Wayland compositor)
-    set -x XDG_RUNTIME_DIR /run/user/0
-    exec labwc
-end
 EOF
 else
+    sudo mkdir -p "$ROOTFS/etc/systemd/system/getty@tty1.service.d/"
+    sudo tee "$ROOTFS/etc/systemd/system/getty@tty1.service.d/override.conf" > /dev/null << 'EOF'
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin root --noclear %I $TERM
+Type=idle
+EOF
     sudo tee "$ROOTFS/root/.config/fish/config.fish" > /dev/null << 'EOF'
 # Console-only mode: Wayland auto-start disabled for debugging
-# Clear any inherited environment variables from build
 set -e DISPLAY
 set -e WAYLAND_DISPLAY
 
-# To start Wayland manually, run: sw
 function sw
     set -x XDG_RUNTIME_DIR /run/user/0
     labwc
@@ -359,7 +413,6 @@ end
 EOF
 fi
 
-# Create a clean .profile that unsets inherited variables
 sudo tee "$ROOTFS/root/.profile" > /dev/null << 'EOF'
 # Clean environment on login
 unset DISPLAY
@@ -368,40 +421,180 @@ export HOME=/root
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 EOF
 
-# Wayland/Cage environment setup
-# Clear any inherited environment variables in /etc/environment
 sudo tee "$ROOTFS/etc/environment" > /dev/null << 'EOF'
-# Clean environment for RPi5 fast boot with Wayland
-# Wayland compositor sets WAYLAND_DISPLAY automatically
+# Clean environment for RPi5 fast boot
 XDG_RUNTIME_DIR=/run/user/0
 EOF
 
-# Create XDG_RUNTIME_DIR for Wayland
+# Create XDG_RUNTIME_DIR for Wayland (console-only / manual labwc)
 sudo mkdir -p "$ROOTFS/run/user/0"
 sudo chmod 700 "$ROOTFS/run/user/0"
 
-# Create a wrapper script for labwc that sets up environment
+# Configure Xorg + RealDash (Waveshare 12.3" landscape + Goodix touch)
+if [[ "$CONSOLE_ONLY" == "false" ]]; then
+    echo "=== 7c. Configuring Xorg for RealDash ==="
+    sudo mkdir -p "$ROOTFS/etc/X11/xorg.conf.d"
+    sudo mkdir -p "$ROOTFS/usr/local/bin"
+
+    # Pick kmsdev: prefer connected DSI (Waveshare), then HDMI, else card1
+    sudo tee "$ROOTFS/usr/local/bin/select-kmsdev" > /dev/null << 'EOF'
+#!/bin/sh
+set -eu
+
+OUT="/etc/X11/xorg.conf.d/99-kmsdev.conf"
+pick_card=""
+
+for s in /sys/class/drm/card*-DSI-*/status; do
+  [ -e "$s" ] || continue
+  if [ "$(cat "$s" 2>/dev/null || echo "")" = "connected" ]; then
+    base="$(basename "$(dirname "$s")")"
+    pick_card="${base%%-*}"
+    break
+  fi
+done
+
+if [ -z "$pick_card" ]; then
+  for s in /sys/class/drm/card*-HDMI-A-*/status; do
+    [ -e "$s" ] || continue
+    if [ "$(cat "$s" 2>/dev/null || echo "")" = "connected" ]; then
+      base="$(basename "$(dirname "$s")")"
+      pick_card="${base%%-*}"
+      break
+    fi
+  done
+fi
+
+if [ -z "$pick_card" ]; then
+  pick_card="card1"
+fi
+
+cat > "$OUT" <<INNER
+Section "Device"
+  Identifier "RPiKMS"
+  Driver "modesetting"
+  Option "kmsdev" "/dev/dri/${pick_card}"
+  Option "PrimaryGPU" "true"
+EndSection
+INNER
+EOF
+    sudo chmod +x "$ROOTFS/usr/local/bin/select-kmsdev"
+
+    sudo tee "$ROOTFS/etc/systemd/system/realdash-kmsdev.service" > /dev/null << 'EOF'
+[Unit]
+Description=Select DRM kmsdev for Xorg (before RealDash)
+DefaultDependencies=no
+After=systemd-udev-settle.service
+Before=realdash.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/select-kmsdev
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable realdash-kmsdev.service" 2>/dev/null || true
+
+    sudo tee "$ROOTFS/etc/X11/xorg.conf.d/10-vtswitch.conf" > /dev/null << 'EOF'
+Section "ServerFlags"
+    Option "DontVTSwitch" "false"
+EndSection
+EOF
+
+    sudo tee "$ROOTFS/etc/X11/xorg.conf.d/40-libinput.conf" > /dev/null << 'EOF'
+Section "InputClass"
+    Identifier "libinput pointer catchall"
+    MatchIsPointer "on"
+    MatchDevicePath "/dev/input/event*"
+    Driver "libinput"
+EndSection
+
+Section "InputClass"
+    Identifier "libinput keyboard catchall"
+    MatchIsKeyboard "on"
+    MatchDevicePath "/dev/input/event*"
+    Driver "libinput"
+EndSection
+EOF
+
+    sudo tee "$ROOTFS/root/.xinitrc" > /dev/null << EOF
+#!/bin/sh
+
+xhost +local:
+
+if command -v xsetroot >/dev/null 2>&1; then
+  xsetroot -cursor_name left_ptr
+fi
+
+if command -v xset >/dev/null 2>&1; then
+  xset -dpms
+  xset s off
+  xset s noblank
+  xset m 0 0
+fi
+
+if command -v unclutter >/dev/null 2>&1; then
+  export DISPLAY=:0
+  unclutter -idle 5 -root &
+fi
+
+xrandr --output ${DSI_CONNECTOR} --mode 720x1920 --rotate ${XRANDR_ROTATE} --primary
+
+# Start RealDash, then apply touch calibration once X/RealDash are up
+/usr/bin/realdash &
+(
+  sleep 2
+  export DISPLAY=:0
+  TOUCH_ID=\$(xinput list | grep -i "goodix" | grep -o 'id=[0-9]*' | cut -d= -f2 | head -1)
+  if [ -n "\$TOUCH_ID" ]; then
+    xinput set-prop "\$TOUCH_ID" "Coordinate Transformation Matrix" 0 1 0 -1 0 1 0 0 1
+    xinput map-to-output "\$TOUCH_ID" ${DSI_CONNECTOR}
+  fi
+) &
+
+wait
+EOF
+    sudo chmod +x "$ROOTFS/root/.xinitrc"
+
+    sudo tee "$ROOTFS/etc/systemd/system/realdash.service" > /dev/null << 'EOF'
+[Unit]
+Description=RealDash (Xorg on tty1)
+After=systemd-user-sessions.service
+After=realdash-kmsdev.service
+Wants=realdash-kmsdev.service
+Conflicts=getty@tty1.service
+
+[Service]
+User=root
+WorkingDirectory=/root
+Environment=HOME=/root
+Environment=DISPLAY=:0
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+ExecStart=/bin/sh -c "xinit /root/.xinitrc -- :0 -auth /root/.Xauthority -nolisten tcp -keeptty vt1"
+Restart=always
+RestartSec=0.5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable realdash.service" 2>/dev/null || true
+fi
+
+# Manual Wayland helper (console-only mode)
 sudo tee "$ROOTFS/usr/local/bin/start-wayland" > /dev/null << 'EOF'
 #!/bin/sh
-# Ensure clean environment before starting Wayland
 unset DISPLAY
 unset WAYLAND_DISPLAY
 export HOME=/root
 export XDG_RUNTIME_DIR=/run/user/0
-
-# Create runtime dir if needed
 mkdir -p "$XDG_RUNTIME_DIR"
 chmod 700 "$XDG_RUNTIME_DIR"
-
-# Check if DRI devices exist
-if [ ! -e /dev/dri/card0 ]; then
-    echo "ERROR: No DRI devices found. GPU driver may not be loaded."
-    echo "Try: ls -la /dev/dri/"
-    echo "Try: dmesg | grep -i drm"
-    exit 1
-fi
-
-# Start labwc
 exec labwc "$@"
 EOF
 sudo chmod +x "$ROOTFS/usr/local/bin/start-wayland"
@@ -425,8 +618,9 @@ kernel=kernel8.img
 disable_splash=1
 boot_delay=0
 
-# Pi5 uses vc4-kms-v3d-pi5, not vc4-kms-v3d
+# Pi5 uses vc4-kms-v3d-pi5; Waveshare 12.3" DSI panel (DSI1, 4-lane) - needs kernel 6.12+ (waveshare-dsi driver)
 dtoverlay=vc4-kms-v3d-pi5
+dtoverlay=vc4-kms-dsi-waveshare-panel-v2,12_3_inch_a_4lane
 
 # Disable Bluetooth and WiFi
 dtoverlay=disable-bt
@@ -439,8 +633,8 @@ dtoverlay=i2c1
 dtoverlay=spi
 dtoverlay=mcp2515-can0,oscillator=12000000,interrupt=25
 
-# Force HDMI hotplug (skip detection wait, but allow EDID for auto-resolution)
-hdmi_force_hotplug=1
+# DSI primary: do NOT force HDMI hotplug so console and GUI (tty1) use the DSI panel
+hdmi_force_hotplug=0
 
 # Disable HDMI CEC (Consumer Electronics Control)
 hdmi_ignore_cec=1
@@ -459,12 +653,17 @@ usb_max_current_enable=1
 # Disable under-voltage warnings (power supply warning during shutdown)
 # Note: Pi5 doesn't fully power off - enters low-power state by design
 avoid_warnings=1
+
+# Optional overclock (uncomment if desired; matches known-good RealDash image)
+# arm_freq=2800
+# gpu_freq=1000
+# over_voltage=4
 EOF
 
 # Create cmdline.txt for kernel parameters
 # Use PARTUUID for root device to work with both SD and USB
-# Use both tty1 (HDMI) and ttyS0 (serial) for console access
-# Optimized for fast boot: quiet, loglevel=3, logo.nologo, no cursor, consoleblank disabled
+# Do NOT add video= or fbcon= rotate here — breaks VT switch when Xorg uses the same DSI.
+# RealDash landscape rotation is done in /root/.xinitrc via xrandr.
 cat << 'EOF' > "$BOOT_DIR/cmdline.txt"
 console=tty1 console=ttyS0,115200 root=PARTUUID=@ROOTPARTUUID@ rootfstype=ext4 rootwait rw quiet loglevel=3 logo.nologo vt.global_cursor_default=0 consoleblank=0 fsck.repair=yes init=/lib/systemd/systemd
 EOF
