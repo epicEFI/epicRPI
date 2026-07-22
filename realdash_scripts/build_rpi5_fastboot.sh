@@ -175,7 +175,7 @@ if [[ "$SKIP_ROOTFS" == "false" ]]; then
         sudo rm -rf "$BUILD_DIR/rootfs"
         mkdir -p "$BUILD_DIR/rootfs"
         sudo debootstrap --arch=arm64 --variant=minbase \
-            --include=labwc,seatd,libseat1,busybox,kmod,udev,fish,systemd,systemd-sysv,systemd-timesyncd,fake-hwclock,dbus,libgl1-mesa-dri,mesa-vulkan-drivers,libwayland-client0,libwayland-server0,libegl1,libgles2,libicu76,iproute2,iputils-ping,nano,openssh-server,wget,gnupg,systemd-resolved,can-utils,firmware-brcm80211,wireless-regdb,iw,wpasupplicant,xserver-xorg-core,xserver-xorg,xinit,xauth,xserver-xorg-input-libinput,x11-xserver-utils,x11-utils,xinput,unclutter \
+            --include=labwc,seatd,libseat1,busybox,kmod,udev,fish,systemd,systemd-sysv,systemd-timesyncd,fake-hwclock,dbus,libgl1-mesa-dri,mesa-vulkan-drivers,libwayland-client0,libwayland-server0,libegl1,libgles2,libicu76,iproute2,iputils-ping,nano,openssh-server,wget,gnupg,systemd-resolved,can-utils,firmware-brcm80211,wireless-regdb,iw,wpasupplicant,xserver-xorg-core,xserver-xorg,xinit,xauth,xserver-xorg-input-libinput,x11-xserver-utils,x11-utils,xinput,unclutter,zenity \
             trixie "$BUILD_DIR/rootfs" http://deb.debian.org/debian
     else
         echo "RootFS already exists, skipping debootstrap (delete rootfs dir to rebuild)"
@@ -220,7 +220,7 @@ sudo chroot "$ROOTFS" /bin/bash -c "export DEBIAN_FRONTEND=noninteractive; apt-g
 sudo chroot "$ROOTFS" /bin/bash -c "export DEBIAN_FRONTEND=noninteractive; apt-get install -y -o Acquire::AllowInsecureRepositories=true -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold rpi-eeprom raspi-config" 2>&1 || echo "Warning: Could not install rpi-eeprom/raspi-config (may need manual install after boot)"
 
 # Ensure Xorg launcher pieces exist (some images end up missing xinit even if Xorg is present)
-sudo chroot "$ROOTFS" /bin/bash -c "export DEBIAN_FRONTEND=noninteractive; apt-get install -y xinit x11-xserver-utils xinput unclutter" 2>&1 || echo "Warning: Could not install xinit/xinput (may need manual install after boot)"
+sudo chroot "$ROOTFS" /bin/bash -c "export DEBIAN_FRONTEND=noninteractive; apt-get install -y xinit x11-xserver-utils xinput unclutter zenity" 2>&1 || echo "Warning: Could not install xinit/xinput/zenity (may need manual install after boot)"
 
 # WiFi: brcmfmac firmware + wpa_supplicant (from Debian non-free-firmware / main)
 # Drivers ship with the kernel; without firmware-brcm80211, wlan0 never appears.

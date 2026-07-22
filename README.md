@@ -278,7 +278,7 @@ Target stack that works on Pi 5 + Waveshare **12.3-DSI-TOUCH-A** (DSI1 → shows
 | **GUI** | RealDash under **Xorg** via `realdash.service` + `/root/.xinitrc` (not labwc) |
 | **Display** | Native panel mode **720×1920**; landscape via `xrandr --output DSI-2 --mode 720x1920 --rotate left --primary` → **1920×720** |
 | **Touch** | Goodix; apply matrix **after** RealDash starts (2s delay). Working matrix for `--rotate left`: `0 1 0 -1 0 1 0 0 1` + `xinput map-to-output … DSI-2` |
-| **Packages** | Need **`xinput`** (separate from `x11-utils`), plus `x11-utils` / xrandr |
+| **Packages** | Need **`xinput`** (separate from `x11-utils`), **`zenity`** (RealDash file dialogs), plus `x11-utils` / xrandr |
 
 ### `/root/.xinitrc` (known-good)
 
@@ -326,8 +326,9 @@ wait
 2. **`xrandr --rotate` alone** orients RealDash; without `--rotate left` + landscape FB size, RealDash looks cropped in portrait 720×1920.
 3. **Touch before RealDash starts** gets reset — delay touch calibration until after `/usr/bin/realdash` is running.
 4. **`xinput` package** is required (`apt-get install -y xinput`). `x11-utils` alone is not enough.
-5. **SSH + live `xinput`** needs `xhost +local:` in `.xinitrc` (and preferably `-auth /root/.Xauthority` on the Xorg line). Fish doesn’t use bash `$(...)` the same way — use `bash -c '...'` for one-liners.
-6. **Kernel cmdline rotation breaks VT switch** with Xorg on the same DSI. Accept portrait tty2 or use SSH for config.
+5. **`zenity`** is required for RealDash file/open dialogs (`apt-get install -y zenity`). Without it, tinyfiledialogs errors on Unix.
+6. **SSH + live `xinput`** needs `xhost +local:` in `.xinitrc` (and preferably `-auth /root/.Xauthority` on the Xorg line). Fish doesn’t use bash `$(...)` the same way — use `bash -c '...'` for one-liners.
+7. **Kernel cmdline rotation breaks VT switch** with Xorg on the same DSI. Accept portrait tty2 or use SSH for config.
 
 ## Adding your own MIPI display
 
