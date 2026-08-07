@@ -194,13 +194,96 @@ You can switch between virtual consoles on the attached display using **Ctrl+Alt
 | Ctrl+Alt+F5 | tty5 | Extra shell |
 | Ctrl+Alt+F6 | tty6 | Extra shell |
 
-To configure auto-brightness, press **Ctrl+Alt+F2** to reach TTY2, then run:
+## BH1750 ambient light / auto-brightness
+
+New RealDash images drive the **Waveshare panel backlight** from a BH1750 lux sensor (I2C). This is real backlight via `/sys/class/backlight/*/brightness` — **not** the old picom opacity workaround (that looked like contrast).
+
+Hardware link: [BH1750 light sensor](https://a.co/d/2t3qrWY) (also listed under [hardware](#hardware)).
+
+### Wiring
+
+Connect the BH1750 to **I2C1** on the Pi 5 (same bus as `dtoverlay=i2c1` in the image):
+
+| BH1750 | Pi 5 |
+|--------|------|
+| VCC | 3.3 V |
+| GND | GND |
+| SDA | GPIO2 (SDA1) |
+| SCL | GPIO3 (SCL1) |
+| ADDR | GND → address **0x23**; pull to 3.3 V → **0x5C** |
+
+The build enables I2C, loads `bh1750` / `i2c-dev`, and `bh1750-sensor.service` tries both `0x23` and `0x5c` on boot.
+
+### Verify the sensor
+
+On **Ctrl+Alt+F2** (or SSH):
 
 ```bash
-auto-brightness setup
+# needs i2c-tools: apt-get install -y i2c-tools
+i2cdetect -y 1
+# expect UU or 23 / 5c in the grid
+
+lsmod | grep bh1750
+ls /sys/bus/iio/devices/
+cat /sys/bus/iio/devices/iio:device*/name
+cat /sys/bus/iio/devices/iio:device*/in_illuminance_raw
 ```
 
-> **VT switch note:** Do **not** put `video=DSI-*:...rotate=` or `fbcon=rotate` in `/boot/cmdline.txt` when RealDash/Xorg runs on the same DSI. Kernel fb rotation freezes tty2 on a snapshot of tty1. Leave cmdline without rotate; landscape is done in X only (see below). tty2 stays portrait — use SSH when you want a landscape shell.
+Cover the sensor / shine a light — the raw value should change. If the sensor was plugged in after boot and is missing:
+
+```bash
+modprobe bh1750
+echo bh1750 0x23 > /sys/bus/i2c/devices/i2c-1/new_device
+# or:
+echo bh1750 0x5c > /sys/bus/i2c/devices/i2c-1/new_device
+```
+
+### Manual backlight (sanity check)
+
+```bash
+ls /sys/class/backlight/
+echo 25 > /sys/class/backlight/*/brightness    # dim
+echo 255 > /sys/class/backlight/*/brightness   # bright (or use max_brightness)
+cat /sys/class/backlight/*/brightness
+cat /sys/class/backlight/*/max_brightness
+```
+
+If that changes panel brightness, auto-brightness can use the same path.
+
+### Calibrate and run
+
+```bash
+auto-brightness setup    # interactive: low/high lux → backlight levels
+auto-brightness start    # or: systemctl start auto-brightness
+auto-brightness status
+auto-brightness set 25   # constant level (stops auto); also: set 50%
+auto-brightness stop
+```
+
+**Setup prompts:**
+
+1. Cover sensor → Enter → choose backlight for dark (default **25**, range `0`–`max_brightness`, usually 0–255).
+2. Bright light on sensor → Enter → choose backlight for bright (default **max**).
+3. **Sample rate** (seconds) — how often to poll. Whole numbers or decimals (`1`, `0.5`, `0.25`).
+4. **Averaging sample count** — integer only (e.g. `5`). Smooths flicker.
+
+Config is saved to `/root/.config/auto-brightness.conf`. Enable on every boot after you’re happy with calibration:
+
+```bash
+systemctl enable --now auto-brightness
+```
+
+### Troubleshooting
+
+| Symptom | Check |
+|---------|--------|
+| `auto-brightness` changes “contrast”, not backlight | Old picom-based script — replace `/usr/local/bin/auto-brightness` from `realdash_scripts/auto-brightness` (new builds already ship the sysfs version) |
+| No I2C device | Wiring, `i2cdetect -y 1`, ADDR pin, `dmesg \| grep -i bh1750` |
+| Sensor probe `-121` | Not connected / wrong address — try the other of `0x23` / `0x5c` |
+| No `/sys/class/backlight/` | Panel backlight driver not bound — see Waveshare display section below |
+| Daemon running but no change | `auto-brightness status`; confirm lux raw moves; re-run `setup` |
+
+More low-level sensor notes: [`bh1750-sensor.md`](bh1750-sensor.md).
 
 ## RealDash
 
@@ -260,11 +343,14 @@ systemctl restart realdash   # restart dashboard (fixes many glitches)
 reboot                       # full Pi reboot (/usr/local/bin/reboot → systemctl)
 poweroff                     # shut down
 
-# optional — if auto-brightness package is installed
+# optional — BH1750 panel auto-brightness (see section above)
 auto-brightness setup
+auto-brightness status
 ```
 
 RealDash CAN, adapters, target IDs, multicast, etc.: see the [RealDash manuals index](https://realdash.net/manuals.php).
+
+> **VT switch note:** Do **not** put `video=DSI-*:...rotate=` or `fbcon=rotate` in `/boot/cmdline.txt` when RealDash/Xorg runs on the same DSI. Kernel fb rotation freezes tty2 on a snapshot of tty1. Leave cmdline without rotate; landscape is done in X only (see Waveshare section). tty2 stays portrait — use SSH when you want a landscape shell.
 
 ## Working Waveshare 12.3" + RealDash (verified)
 

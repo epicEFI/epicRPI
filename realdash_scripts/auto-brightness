@@ -1,0 +1,256 @@
+#!/bin/bash
+# Ambient light → Waveshare panel backlight (/sys/class/backlight/*/brightness)
+# Usage: auto-brightness {setup|start|stop|status|set <0-max|N%>|daemon}
+#
+# Replaces the old picom opacity workaround.
+
+CONFIG_FILE="/root/.config/auto-brightness.conf"
+PID_FILE="/var/run/auto-brightness.pid"
+UPDATE_INTERVAL=1
+SAMPLE_SIZE=5
+
+find_backlight() {
+    local d
+    for d in /sys/class/backlight/*; do
+        [ -f "$d/brightness" ] && [ -f "$d/max_brightness" ] || continue
+        echo "$d"
+        return 0
+    done
+    return 1
+}
+
+find_sensor() {
+    local name_file
+    for name_file in /sys/bus/iio/devices/iio:device*/name; do
+        [ -f "$name_file" ] || continue
+        if grep -qi bh1750 "$name_file" 2>/dev/null; then
+            local base
+            base=$(dirname "$name_file")
+            if [ -f "$base/in_illuminance_raw" ]; then
+                echo "$base/in_illuminance_raw"
+                return 0
+            fi
+        fi
+    done
+    for f in /sys/bus/iio/devices/iio:device*/in_illuminance_raw; do
+        [ -f "$f" ] && echo "$f" && return 0
+    done
+    return 1
+}
+
+ensure_sensor() {
+    local path
+    path=$(find_sensor) && { echo "$path"; return 0; }
+    modprobe bh1750 2>/dev/null || true
+    sleep 1
+    if [ -e /sys/bus/i2c/devices/i2c-1/new_device ]; then
+        echo bh1750 0x23 > /sys/bus/i2c/devices/i2c-1/new_device 2>/dev/null || true
+        sleep 1
+        echo bh1750 0x5c > /sys/bus/i2c/devices/i2c-1/new_device 2>/dev/null || true
+        sleep 1
+    fi
+    find_sensor
+}
+
+set_backlight() {
+    local value=$1
+    local bl
+    bl=$(find_backlight) || {
+        echo "Error: no /sys/class/backlight/*/brightness device" >&2
+        return 1
+    }
+    local max
+    max=$(cat "$bl/max_brightness")
+    if [ "$value" -lt 0 ]; then value=0; fi
+    if [ "$value" -gt "$max" ]; then value=$max; fi
+    echo "$value" > "$bl/brightness"
+    echo "Backlight set to $value / $max ($bl)"
+}
+
+parse_brightness_arg() {
+    local arg=$1
+    local bl max
+    bl=$(find_backlight) || return 1
+    max=$(cat "$bl/max_brightness")
+    if [[ "$arg" == *% ]]; then
+        local pct=${arg%\%}
+        echo $(( pct * max / 100 ))
+    else
+        echo "$arg"
+    fi
+}
+
+setup_calibration() {
+    local SENSOR_PATH
+    SENSOR_PATH=$(ensure_sensor) || {
+        echo "WARNING: BH1750 not found under /sys/bus/iio/devices/" >&2
+        echo "Wire the sensor (I2C1), then: i2cdetect -y 1" >&2
+        echo "You can still set a constant level: auto-brightness set 25" >&2
+        exit 1
+    }
+    local bl max
+    bl=$(find_backlight) || {
+        echo "Error: no backlight sysfs device" >&2
+        exit 1
+    }
+    max=$(cat "$bl/max_brightness")
+
+    echo "=== Auto-Brightness Calibration (panel backlight) ==="
+    echo "Backlight: $bl (0-$max)"
+    echo "Sensor:    $SENSOR_PATH"
+    echo ""
+    echo "Step 1: Cover sensor (low light)"
+    read -r -p "Press Enter when sensor is covered..."
+    local low_light
+    low_light=$(cat "$SENSOR_PATH")
+    echo "  Low light reading: $low_light"
+    read -r -p "Enter backlight (0-$max) for low light [25]: " low_bright
+    low_bright=${low_bright:-25}
+
+    echo ""
+    echo "Step 2: Expose sensor to bright light"
+    read -r -p "Press Enter when sensor is in bright light..."
+    local high_light
+    high_light=$(cat "$SENSOR_PATH")
+    echo "  High light reading: $high_light"
+    read -r -p "Enter backlight (0-$max) for bright light [$max]: " high_bright
+    high_bright=${high_bright:-$max}
+
+    echo ""
+    read -r -p "Sample rate in seconds [1]: " update_interval
+    update_interval=${update_interval:-1}
+    read -r -p "Averaging sample count [5]: " sample_size
+    sample_size=${sample_size:-5}
+
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    cat > "$CONFIG_FILE" << CONFIGEOF
+LOW_LIGHT=$low_light
+LOW_BRIGHTNESS=$low_bright
+HIGH_LIGHT=$high_light
+HIGH_BRIGHTNESS=$high_bright
+UPDATE_INTERVAL=$update_interval
+SAMPLE_SIZE=$sample_size
+CONFIGEOF
+
+    echo ""
+    echo "Saved $CONFIG_FILE"
+    echo "  Low:  $low_light lux-raw -> backlight $low_bright"
+    echo "  High: $high_light lux-raw -> backlight $high_bright"
+    echo "Start with: auto-brightness start   (or systemctl start auto-brightness)"
+}
+
+map_light_to_brightness() {
+    local light=$1
+    local low_light=${LOW_LIGHT:-50}
+    local low_bright=${LOW_BRIGHTNESS:-25}
+    local high_light=${HIGH_LIGHT:-500}
+    local high_bright=${HIGH_BRIGHTNESS:-255}
+
+    if [ "$light" -le "$low_light" ]; then
+        echo "$low_bright"
+    elif [ "$light" -ge "$high_light" ]; then
+        echo "$high_bright"
+    else
+        local range=$((high_light - low_light))
+        local position=$((light - low_light))
+        local ratio=$((position * 1000 / range))
+        local brightness_range=$((high_bright - low_bright))
+        echo $((low_bright + (brightness_range * ratio / 1000)))
+    fi
+}
+
+run_daemon() {
+    [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
+    UPDATE_INTERVAL=${UPDATE_INTERVAL:-1}
+    SAMPLE_SIZE=${SAMPLE_SIZE:-5}
+
+    local bl
+    bl=$(find_backlight) || {
+        echo "Error: no backlight device" >&2
+        exit 1
+    }
+    local max
+    max=$(cat "$bl/max_brightness")
+    local default_brightness=${CONSTANT_BRIGHTNESS:-$max}
+
+    declare -a samples=()
+    local current_index=0
+
+    while true; do
+        local SENSOR_PATH
+        SENSOR_PATH=$(find_sensor 2>/dev/null || true)
+        if [ -n "$SENSOR_PATH" ] && [ -f "$SENSOR_PATH" ]; then
+            local light_raw
+            light_raw=$(cat "$SENSOR_PATH" 2>/dev/null || echo "")
+            if [ -n "$light_raw" ] && [ "$light_raw" -ge 0 ] 2>/dev/null; then
+                local target
+                target=$(map_light_to_brightness "$light_raw")
+                samples[$current_index]=$target
+                current_index=$(((current_index + 1) % SAMPLE_SIZE))
+
+                local sum=0 count=0 sample
+                for sample in "${samples[@]}"; do
+                    if [ -n "$sample" ]; then
+                        sum=$((sum + sample))
+                        count=$((count + 1))
+                    fi
+                done
+                if [ "$count" -gt 0 ]; then
+                    local smoothed=$((sum / count))
+                    [ "$smoothed" -gt "$max" ] && smoothed=$max
+                    [ "$smoothed" -lt 0 ] && smoothed=0
+                    echo "$smoothed" > "$bl/brightness"
+                fi
+            fi
+        else
+            echo "$default_brightness" > "$bl/brightness"
+        fi
+        sleep "$UPDATE_INTERVAL"
+    done
+}
+
+case "$1" in
+    setup) setup_calibration ;;
+    start)
+        if pgrep -f "auto-brightness daemon" >/dev/null; then
+            echo "Already running"
+        else
+            nohup "$0" daemon > /dev/null 2>&1 &
+            echo $! > "$PID_FILE"
+            echo "Started (PID: $(cat "$PID_FILE"))"
+        fi
+        ;;
+    stop)
+        [ -f "$PID_FILE" ] && kill "$(cat "$PID_FILE")" 2>/dev/null
+        rm -f "$PID_FILE"
+        pkill -f "auto-brightness daemon" 2>/dev/null || true
+        echo "Stopped"
+        ;;
+    status)
+        if pgrep -f "auto-brightness daemon" >/dev/null; then
+            echo "Auto-brightness: RUNNING"
+        else
+            echo "Auto-brightness: STOPPED"
+        fi
+        bl=$(find_backlight) && echo "Backlight: $(cat "$bl/brightness") / $(cat "$bl/max_brightness") ($bl)"
+        SENSOR_PATH=$(find_sensor 2>/dev/null || true)
+        [ -n "$SENSOR_PATH" ] && echo "Sensor: $(cat "$SENSOR_PATH") ($SENSOR_PATH)"
+        [ -f "$CONFIG_FILE" ] && { echo "Config:"; cat "$CONFIG_FILE"; }
+        ;;
+    set)
+        [ -z "$2" ] && { echo "Usage: auto-brightness set <0-max|N%>"; exit 1; }
+        "$0" stop >/dev/null
+        val=$(parse_brightness_arg "$2") || exit 1
+        set_backlight "$val"
+        ;;
+    daemon) run_daemon ;;
+    *)
+        echo "Usage: auto-brightness {setup|start|stop|status|set <0-max|N%>}"
+        echo "  setup  - Calibrate BH1750 → panel backlight"
+        echo "  start  - Start daemon"
+        echo "  stop   - Stop daemon"
+        echo "  status - Show backlight / sensor / config"
+        echo "  set    - Constant backlight (stops auto); e.g. set 25 or set 50%"
+        exit 1
+        ;;
+esac

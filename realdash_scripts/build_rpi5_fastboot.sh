@@ -325,6 +325,50 @@ sudo tee "$ROOTFS/etc/modules-load.d/bh1750.conf" > /dev/null << 'EOF'
 bh1750
 EOF
 
+# Auto-brightness: BH1750 lux → Waveshare panel backlight via sysfs
+# (replaces the old picom opacity workaround)
+echo "=== 7b.1 Configuring panel auto-brightness (sysfs backlight) ==="
+sudo cp "$SCRIPT_DIR/auto-brightness" "$ROOTFS/usr/local/bin/auto-brightness"
+sudo chmod +x "$ROOTFS/usr/local/bin/auto-brightness"
+
+sudo tee "$ROOTFS/etc/systemd/system/bh1750-sensor.service" > /dev/null << 'EOF'
+[Unit]
+Description=Load BH1750 light sensor on I2C1
+After=local-fs.target
+Before=auto-brightness.service
+
+[Service]
+Type=oneshot
+ExecStart=/sbin/modprobe bh1750
+ExecStart=/bin/sh -c 'echo bh1750 0x23 > /sys/bus/i2c/devices/i2c-1/new_device 2>/dev/null || true'
+ExecStart=/bin/sh -c 'sleep 1; echo bh1750 0x5c > /sys/bus/i2c/devices/i2c-1/new_device 2>/dev/null || true'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable bh1750-sensor.service" 2>/dev/null || true
+
+sudo tee "$ROOTFS/etc/systemd/system/auto-brightness.service" > /dev/null << 'EOF'
+[Unit]
+Description=Auto-brightness (BH1750 → panel backlight)
+After=bh1750-sensor.service
+Wants=bh1750-sensor.service
+
+[Service]
+Type=simple
+User=root
+ExecStartPre=/bin/sleep 2
+ExecStart=/usr/local/bin/auto-brightness daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+# Enabled but needs calibration for useful mapping; start after: auto-brightness setup
+sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable auto-brightness.service" 2>/dev/null || true
+
 # Blacklist Bluetooth only (WiFi stays enabled; BT still off via dtoverlay=disable-bt)
 sudo mkdir -p "$ROOTFS/etc/modprobe.d"
 sudo rm -f "$ROOTFS/etc/modprobe.d/disable-wifi-bt.conf"
