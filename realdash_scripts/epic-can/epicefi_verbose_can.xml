@@ -1,0 +1,238 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- EpicEFI / rusEFI RealDash CAN XML — LISTEN / DECODE ONLY (ECU transmits) -->
+<!-- TWO SEPARATE ECU TX PATHS — do not merge: -->
+<!--   1) Verbose CAN: fixed firmware broadcast from rusEFI_CAN_verbose.dbc, IDs 512..523. -->
+<!--      No Math/Logic/GPPWM/custom user channels in Verbose. -->
+<!--   2) Custom CAN Outputs: TunerStudio slots at 1280..1287 (0x500..0x507) = outputs 1..8. -->
+<!--      1..6: eight uint8 bytes. 7..8: four uint16 BE words. Not in DBC; never on 512..523. -->
+<!-- Not Mega Epic get_var. RealDash does not TX these frames. -->
+<!-- Bus: classic CAN 500 kbit/s, 11-bit. Verbose=@1 little-endian. CanOut 16-bit = big-endian. -->
+<RealDashCAN version="2">
+  <frames>
+
+    <!-- ========== 1) VERBOSE CAN (DBC only) ========== -->
+    <!-- ID 512 (0x200) Status / DBC BASE0 -->
+    <frame id="512" endianess="little" readOnly="true">
+      <value name="Verbose_WarningCounter" offset="0" length="2" endianess="little"></value> <!-- DBC WarningCounter: flag scale=1.0 offset=0.0 -->
+      <value name="Verbose_LastError" offset="2" length="2" endianess="little"></value> <!-- DBC LastError: flag scale=1.0 offset=0.0 -->
+      <value name="Verbose_RevLimAct" startbit="32" bitcount="1" units="bit"></value> <!-- DBC RevLimAct: flag scale=1.0 offset=0.0 -->
+      <value name="Verbose_MainRelayAct" startbit="33" bitcount="1" units="bit"></value> <!-- DBC MainRelayAct: flag scale=1.0 offset=0.0 -->
+      <value name="Verbose_FuelPumpAct" startbit="34" bitcount="1" units="bit"></value> <!-- DBC FuelPumpAct: flag scale=1.0 offset=0.0 -->
+      <value name="Verbose_CELAct" startbit="35" bitcount="1" units="bit"></value> <!-- DBC CELAct: flag scale=1.0 offset=0.0 -->
+      <value name="Verbose_EGOHeatAct" startbit="36" bitcount="1" units="bit"></value> <!-- DBC EGOHeatAct: flag scale=1.0 offset=0.0 -->
+      <value name="Verbose_LambdaProtectAct" startbit="37" bitcount="1" units="bit"></value> <!-- DBC LambdaProtectAct: flag scale=1.0 offset=0.0 -->
+      <value name="Verbose_CurrentGear" offset="5" length="1" endianess="little"></value> <!-- DBC CurrentGear: flag scale=1.0 offset=0.0 -->
+      <value name="Verbose_DistanceTraveled" offset="6" length="2" endianess="little" conversion="V*0.1" rangeMin="0" rangeMax="6553.5"></value> <!-- DBC DistanceTraveled: km scale=0.1 offset=0.0 -->
+      <value name="Verbose_Fan" startbit="38" bitcount="1" units="bit"></value> <!-- DBC Fan: flag scale=1.0 offset=0.0 -->
+      <value name="Verbose_Fan2" startbit="39" bitcount="1" units="bit"></value> <!-- DBC Fan2: flag scale=1.0 offset=0.0 -->
+    </frame>
+
+    <!-- ID 513 (0x201) Speeds / DBC BASE1 -->
+    <frame id="513" endianess="little" readOnly="true">
+      <value name="Verbose_RPM" offset="0" length="2" endianess="little" units="RPM"></value> <!-- DBC RPM: RPM scale=1.0 offset=0.0 -->
+      <value targetId="37" offset="0" length="2" endianess="little" units="RPM"></value> <!-- stock RealDash input -->
+      <value name="Verbose_IgnitionTiming" offset="2" length="2" endianess="little" signed="true" conversion="V*0.02" units="deg"></value> <!-- DBC IgnitionTiming: deg scale=0.02 offset=0.0 -->
+      <value targetId="13" offset="2" length="2" endianess="little" signed="true" conversion="V*0.02" units="deg"></value> <!-- stock RealDash input -->
+      <value name="Verbose_InjDuty" offset="4" length="1" endianess="little" conversion="V*0.5" units="%" rangeMin="0" rangeMax="100"></value> <!-- DBC InjDuty: % scale=0.5 offset=0.0 -->
+      <value targetId="17" offset="4" length="1" endianess="little" conversion="V*0.5" units="%"></value> <!-- stock RealDash input -->
+      <value name="Verbose_IgnDuty" offset="5" length="1" endianess="little" conversion="V*0.5" units="%" rangeMin="0" rangeMax="100"></value> <!-- DBC IgnDuty: % scale=0.5 offset=0.0 -->
+      <value name="Verbose_VehicleSpeed" offset="6" length="1" endianess="little" units="km/h" rangeMin="0" rangeMax="255"></value> <!-- DBC VehicleSpeed: kph scale=1.0 offset=0.0 -->
+      <value targetId="64" offset="6" length="1" endianess="little" units="km/h"></value> <!-- stock RealDash input -->
+      <value name="Verbose_FlexPct" offset="7" length="1" endianess="little" units="%" rangeMin="0" rangeMax="100"></value> <!-- DBC FlexPct: % scale=1.0 offset=0.0 -->
+    </frame>
+
+    <!-- ID 514 (0x202) Pedal/TPS / DBC BASE2 -->
+    <frame id="514" endianess="little" readOnly="true">
+      <value name="Verbose_PPS" offset="0" length="2" endianess="little" signed="true" conversion="V*0.01" units="%" rangeMin="0" rangeMax="100"></value> <!-- DBC PPS: % scale=0.01 offset=0.0 -->
+      <value name="Verbose_TPS1" offset="2" length="2" endianess="little" signed="true" conversion="V*0.01" units="%" rangeMin="0" rangeMax="100"></value> <!-- DBC TPS1: % scale=0.01 offset=0.0 -->
+      <value targetId="42" offset="2" length="2" endianess="little" signed="true" conversion="V*0.01" units="%"></value> <!-- stock RealDash input -->
+      <value name="Verbose_TPS2" offset="4" length="2" endianess="little" signed="true" conversion="V*0.01" units="%" rangeMin="0" rangeMax="100"></value> <!-- DBC TPS2: % scale=0.01 offset=0.0 -->
+      <value name="Verbose_Wastegate" offset="6" length="2" endianess="little" signed="true" conversion="V*0.01" units="%" rangeMin="0" rangeMax="100"></value> <!-- DBC Wastegate: % scale=0.01 offset=0.0 -->
+    </frame>
+
+    <!-- ID 515 (0x203) Sensors1 / DBC BASE3 -->
+    <frame id="515" endianess="little" readOnly="true">
+      <value name="Verbose_MAP" offset="0" length="2" endianess="little" conversion="V*0.03333333" units="kPa"></value> <!-- DBC MAP: kPa scale=0.03333333 offset=0.0 -->
+      <value targetId="31" offset="0" length="2" endianess="little" conversion="V*0.03333333" units="kPa"></value> <!-- stock RealDash input -->
+      <value name="Verbose_CoolantTemp" offset="2" length="1" endianess="little" conversion="V-40" units="C" rangeMin="-40" rangeMax="200"></value> <!-- DBC CoolantTemp: deg C scale=1.0 offset=-40.0 -->
+      <value targetId="14" offset="2" length="1" endianess="little" conversion="V-40" units="C"></value> <!-- stock RealDash input -->
+      <value name="Verbose_IntakeTemp" offset="3" length="1" endianess="little" conversion="V-40" units="C" rangeMin="-40" rangeMax="200"></value> <!-- DBC IntakeTemp: deg C scale=1.0 offset=-40.0 -->
+      <value targetId="27" offset="3" length="1" endianess="little" conversion="V-40" units="C"></value> <!-- stock RealDash input -->
+      <value name="Verbose_AUX1Temp" offset="4" length="1" endianess="little" conversion="V-40" units="C" rangeMin="-40" rangeMax="200"></value> <!-- DBC AUX1Temp: deg C scale=1.0 offset=-40.0 -->
+      <value name="Verbose_AUX2Temp" offset="5" length="1" endianess="little" conversion="V-40" units="C" rangeMin="-40" rangeMax="200"></value> <!-- DBC AUX2Temp: deg C scale=1.0 offset=-40.0 -->
+      <value name="Verbose_MCUTemp" offset="6" length="1" endianess="little" conversion="V-40" units="C" rangeMin="-40" rangeMax="100"></value> <!-- DBC MCUTemp: deg C scale=1.0 offset=-40.0 -->
+      <value name="Verbose_FuelLevel" offset="7" length="1" endianess="little" conversion="V*0.5" units="%"></value> <!-- DBC FuelLevel: % scale=0.5 offset=0.0 -->
+    </frame>
+
+    <!-- ID 516 (0x204) Sensors2 / DBC BASE4 -->
+    <frame id="516" endianess="little" readOnly="true">
+      <value name="Verbose_OilPress" offset="2" length="2" endianess="little" conversion="V*0.03333333" units="kPa"></value> <!-- DBC OilPress: kPa scale=0.03333333 offset=0.0 -->
+      <value name="Verbose_OilTemperature" offset="4" length="1" endianess="little" conversion="V-40" units="C" rangeMin="-40" rangeMax="215"></value> <!-- DBC OilTemperature: deg C scale=1.0 offset=-40.0 -->
+      <value targetId="15" offset="4" length="1" endianess="little" conversion="V-40" units="C"></value> <!-- stock RealDash input -->
+      <value name="Verbose_FuelTemperature" offset="5" length="1" endianess="little" conversion="V-40" units="C" rangeMin="-40" rangeMax="215"></value> <!-- DBC FuelTemperature: deg C scale=1.0 offset=-40.0 -->
+      <value name="Verbose_BattVolt" offset="6" length="2" endianess="little" conversion="V*0.001" rangeMin="0" rangeMax="25"></value> <!-- DBC BattVolt: mV scale=0.001 offset=0.0 -->
+      <value targetId="12" offset="6" length="2" endianess="little" conversion="V*0.001" units="V"></value> <!-- stock RealDash input -->
+    </frame>
+
+    <!-- ID 517 (0x205) Fueling / DBC BASE5 -->
+    <frame id="517" endianess="little" readOnly="true">
+      <value name="Verbose_CylAM" offset="0" length="2" endianess="little"></value> <!-- DBC CylAM: mg scale=1.0 offset=0.0 -->
+      <value name="Verbose_EstMAF" offset="2" length="2" endianess="little" conversion="V*0.01"></value> <!-- DBC EstMAF: kg/h scale=0.01 offset=0.0 -->
+      <value name="Verbose_InjPW" offset="4" length="2" endianess="little" conversion="V*0.003333333"></value> <!-- DBC InjPW: ms scale=0.003333333 offset=0.0 -->
+      <value name="Verbose_KnockCt" offset="6" length="2" endianess="little"></value> <!-- DBC KnockCt: count scale=1.0 offset=0.0 -->
+    </frame>
+
+    <!-- ID 518 (0x206) Fueling2 / DBC BASE6 -->
+    <frame id="518" endianess="little" readOnly="true">
+      <value name="Verbose_FuelUsed" offset="0" length="2" endianess="little"></value> <!-- DBC FuelUsed: g scale=1.0 offset=0.0 -->
+      <value name="Verbose_FuelFlow" offset="2" length="2" endianess="little" conversion="V*0.005" rangeMin="0" rangeMax="327"></value> <!-- DBC FuelFlow: g/s scale=0.005 offset=0.0 -->
+      <value name="Verbose_FuelTrim1" offset="4" length="2" endianess="little" signed="true" conversion="V*0.01" units="%" rangeMin="-50" rangeMax="50"></value> <!-- DBC FuelTrim1: % scale=0.01 offset=0.0 -->
+      <value name="Verbose_FuelTrim2" offset="6" length="2" endianess="little" signed="true" conversion="V*0.01" units="%" rangeMin="-50" rangeMax="50"></value> <!-- DBC FuelTrim2: % scale=0.01 offset=0.0 -->
+    </frame>
+
+    <!-- ID 519 (0x207) Fueling3 / DBC BASE7 -->
+    <frame id="519" endianess="little" readOnly="true">
+      <value name="Verbose_Lam1" offset="0" length="2" endianess="little" conversion="V*0.0001" rangeMin="0" rangeMax="2"></value> <!-- DBC Lam1: lambda scale=0.0001 offset=0.0 -->
+      <value targetId="254" offset="0" length="2" endianess="little" conversion="V*0.0001"></value> <!-- stock RealDash input -->
+      <value name="Verbose_Lam2" offset="2" length="2" endianess="little" conversion="V*0.0001" rangeMin="0" rangeMax="2"></value> <!-- DBC Lam2: lambda scale=0.0001 offset=0.0 -->
+      <value targetId="255" offset="2" length="2" endianess="little" conversion="V*0.0001"></value> <!-- stock RealDash input -->
+      <value name="Verbose_FpLow" offset="4" length="2" endianess="little" conversion="V*0.03333333" units="kPa"></value> <!-- DBC FpLow: kPa scale=0.03333333 offset=0.0 -->
+      <value name="Verbose_FpHigh" offset="6" length="2" endianess="little" conversion="V*0.1" units="bar"></value> <!-- DBC FpHigh: bar scale=0.1 offset=0.0 -->
+    </frame>
+
+    <!-- ID 520 (0x208) Cams / DBC BASE8 -->
+    <frame id="520" endianess="little" readOnly="true">
+      <value name="Verbose_Cam1I" offset="0" length="1" endianess="little" signed="true" units="deg" rangeMin="-100" rangeMax="100"></value> <!-- DBC Cam1I: deg scale=1.0 offset=0.0 -->
+      <value name="Verbose_Cam1Itar" offset="1" length="1" endianess="little" signed="true" units="deg" rangeMin="-100" rangeMax="100"></value> <!-- DBC Cam1Itar: deg scale=1.0 offset=0.0 -->
+      <value name="Verbose_Cam1E" offset="2" length="1" endianess="little" signed="true" units="deg" rangeMin="-100" rangeMax="100"></value> <!-- DBC Cam1E: deg scale=1.0 offset=0.0 -->
+      <value name="Verbose_Cam1Etar" offset="3" length="1" endianess="little" signed="true" units="deg" rangeMin="-100" rangeMax="100"></value> <!-- DBC Cam1Etar: deg scale=1.0 offset=0.0 -->
+      <value name="Verbose_Cam2I" offset="4" length="1" endianess="little" signed="true" units="deg" rangeMin="-100" rangeMax="100"></value> <!-- DBC Cam2I: deg scale=1.0 offset=0.0 -->
+      <value name="Verbose_Cam2Itar" offset="5" length="1" endianess="little" signed="true" units="deg" rangeMin="-100" rangeMax="100"></value> <!-- DBC Cam2Itar: deg scale=1.0 offset=0.0 -->
+      <value name="Verbose_Cam2E" offset="6" length="1" endianess="little" signed="true" units="deg" rangeMin="-100" rangeMax="100"></value> <!-- DBC Cam2E: deg scale=1.0 offset=0.0 -->
+      <value name="Verbose_Cam2Etar" offset="7" length="1" endianess="little" signed="true" units="deg" rangeMin="-100" rangeMax="100"></value> <!-- DBC Cam2Etar: deg scale=1.0 offset=0.0 -->
+    </frame>
+
+    <!-- ID 521 (0x209) EGT / DBC BASE9 -->
+    <frame id="521" endianess="little" readOnly="true">
+      <value name="Verbose_Egt1" offset="0" length="1" endianess="little" conversion="V*5" units="C" rangeMin="0" rangeMax="1250"></value> <!-- DBC Egt1: deg C scale=5.0 offset=0.0 -->
+      <value name="Verbose_Egt2" offset="1" length="1" endianess="little" conversion="V*5" units="C" rangeMin="0" rangeMax="1250"></value> <!-- DBC Egt2: deg C scale=5.0 offset=0.0 -->
+      <value name="Verbose_Egt3" offset="2" length="1" endianess="little" conversion="V*5" units="C" rangeMin="0" rangeMax="1250"></value> <!-- DBC Egt3: deg C scale=5.0 offset=0.0 -->
+      <value name="Verbose_Egt4" offset="3" length="1" endianess="little" conversion="V*5" units="C" rangeMin="0" rangeMax="1250"></value> <!-- DBC Egt4: deg C scale=5.0 offset=0.0 -->
+      <value name="Verbose_Egt5" offset="4" length="1" endianess="little" conversion="V*5" units="C" rangeMin="0" rangeMax="1250"></value> <!-- DBC Egt5: deg C scale=5.0 offset=0.0 -->
+      <value name="Verbose_Egt6" offset="5" length="1" endianess="little" conversion="V*5" units="C" rangeMin="0" rangeMax="1250"></value> <!-- DBC Egt6: deg C scale=5.0 offset=0.0 -->
+      <value name="Verbose_Egt7" offset="6" length="1" endianess="little" conversion="V*5" units="C" rangeMin="0" rangeMax="1250"></value> <!-- DBC Egt7: deg C scale=5.0 offset=0.0 -->
+      <value name="Verbose_Egt8" offset="7" length="1" endianess="little" conversion="V*5" units="C" rangeMin="0" rangeMax="1250"></value> <!-- DBC Egt8: deg C scale=5.0 offset=0.0 -->
+    </frame>
+
+    <!-- ID 522 (0x20A) Knock / DBC BASE10 -->
+    <frame id="522" endianess="little" readOnly="true">
+      <value name="Verbose_knock0" offset="0" length="1" endianess="little" signed="true" rangeMin="-60" rangeMax="10"></value> <!-- DBC knock0: db scale=1.0 offset=0.0 -->
+      <value name="Verbose_knock1" offset="1" length="1" endianess="little" signed="true" rangeMin="-60" rangeMax="10"></value> <!-- DBC knock1: db scale=1.0 offset=0.0 -->
+      <value name="Verbose_knock2" offset="2" length="1" endianess="little" signed="true" rangeMin="-60" rangeMax="10"></value> <!-- DBC knock2: db scale=1.0 offset=0.0 -->
+      <value name="Verbose_knock3" offset="3" length="1" endianess="little" signed="true" rangeMin="-60" rangeMax="10"></value> <!-- DBC knock3: db scale=1.0 offset=0.0 -->
+      <value name="Verbose_knock4" offset="4" length="1" endianess="little" signed="true" rangeMin="-60" rangeMax="10"></value> <!-- DBC knock4: db scale=1.0 offset=0.0 -->
+      <value name="Verbose_knock5" offset="5" length="1" endianess="little" signed="true" rangeMin="-60" rangeMax="10"></value> <!-- DBC knock5: db scale=1.0 offset=0.0 -->
+      <value name="Verbose_knock6" offset="6" length="1" endianess="little" signed="true" rangeMin="-60" rangeMax="10"></value> <!-- DBC knock6: db scale=1.0 offset=0.0 -->
+      <value name="Verbose_knock7" offset="7" length="1" endianess="little" signed="true" rangeMin="-60" rangeMax="10"></value> <!-- DBC knock7: db scale=1.0 offset=0.0 -->
+    </frame>
+
+    <!-- ID 523 (0x20B) Status11 (BrakePedal) / DBC BASE11 -->
+    <frame id="523" endianess="little" readOnly="true">
+      <value name="Verbose_BrakePedal" startbit="0" bitcount="1" units="bit"></value> <!-- DBC BrakePedal: flag scale=1.0 offset=0.0 -->
+    </frame>
+
+    <!-- ========== 2) CUSTOM CAN OUTPUTS (TunerStudio slots; NOT in DBC) ========== -->
+    <!-- ECU TX → RealDash RX. IDs 1280..1287 (0x500..0x507) = CAN Output 1..8. -->
+    <!-- Outputs 1..6: uint8 B0..B7, value=raw. Outputs 7..8: four uint16 BE words, value=raw. -->
+    <!-- Never on Verbose IDs 512..523. -->
+
+    <!-- CAN Output 1 -> ID 1280 (0x500) — eight uint8 -->
+    <frame id="1280" readOnly="true">
+      <value name="CanOut1_B0" offset="0" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut1_B1" offset="1" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut1_B2" offset="2" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut1_B3" offset="3" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut1_B4" offset="4" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut1_B5" offset="5" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut1_B6" offset="6" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut1_B7" offset="7" length="1" rangeMin="0" rangeMax="255"></value>
+    </frame>
+
+    <!-- CAN Output 2 -> ID 1281 (0x501) — eight uint8 -->
+    <frame id="1281" readOnly="true">
+      <value name="CanOut2_B0" offset="0" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut2_B1" offset="1" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut2_B2" offset="2" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut2_B3" offset="3" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut2_B4" offset="4" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut2_B5" offset="5" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut2_B6" offset="6" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut2_B7" offset="7" length="1" rangeMin="0" rangeMax="255"></value>
+    </frame>
+
+    <!-- CAN Output 3 -> ID 1282 (0x502) — eight uint8 -->
+    <frame id="1282" readOnly="true">
+      <value name="CanOut3_B0" offset="0" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut3_B1" offset="1" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut3_B2" offset="2" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut3_B3" offset="3" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut3_B4" offset="4" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut3_B5" offset="5" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut3_B6" offset="6" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut3_B7" offset="7" length="1" rangeMin="0" rangeMax="255"></value>
+    </frame>
+
+    <!-- CAN Output 4 -> ID 1283 (0x503) — eight uint8 -->
+    <frame id="1283" readOnly="true">
+      <value name="CanOut4_B0" offset="0" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut4_B1" offset="1" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut4_B2" offset="2" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut4_B3" offset="3" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut4_B4" offset="4" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut4_B5" offset="5" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut4_B6" offset="6" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut4_B7" offset="7" length="1" rangeMin="0" rangeMax="255"></value>
+    </frame>
+
+    <!-- CAN Output 5 -> ID 1284 (0x504) — eight uint8 -->
+    <frame id="1284" readOnly="true">
+      <value name="CanOut5_B0" offset="0" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut5_B1" offset="1" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut5_B2" offset="2" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut5_B3" offset="3" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut5_B4" offset="4" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut5_B5" offset="5" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut5_B6" offset="6" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut5_B7" offset="7" length="1" rangeMin="0" rangeMax="255"></value>
+    </frame>
+
+    <!-- CAN Output 6 -> ID 1285 (0x505) — eight uint8 -->
+    <frame id="1285" readOnly="true">
+      <value name="CanOut6_B0" offset="0" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut6_B1" offset="1" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut6_B2" offset="2" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut6_B3" offset="3" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut6_B4" offset="4" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut6_B5" offset="5" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut6_B6" offset="6" length="1" rangeMin="0" rangeMax="255"></value>
+      <value name="CanOut6_B7" offset="7" length="1" rangeMin="0" rangeMax="255"></value>
+    </frame>
+
+    <!-- CAN Output 7 -> ID 1286 (0x506) — four uint16 BE (W0..W3) -->
+    <frame id="1286" endianess="big" readOnly="true">
+      <value name="CanOut7_W0" offset="0" length="2" endianess="big" rangeMin="0" rangeMax="65535"></value>
+      <value name="CanOut7_W1" offset="2" length="2" endianess="big" rangeMin="0" rangeMax="65535"></value>
+      <value name="CanOut7_W2" offset="4" length="2" endianess="big" rangeMin="0" rangeMax="65535"></value>
+      <value name="CanOut7_W3" offset="6" length="2" endianess="big" rangeMin="0" rangeMax="65535"></value>
+    </frame>
+
+    <!-- CAN Output 8 -> ID 1287 (0x507) — four uint16 BE (W0..W3) -->
+    <frame id="1287" endianess="big" readOnly="true">
+      <value name="CanOut8_W0" offset="0" length="2" endianess="big" rangeMin="0" rangeMax="65535"></value>
+      <value name="CanOut8_W1" offset="2" length="2" endianess="big" rangeMin="0" rangeMax="65535"></value>
+      <value name="CanOut8_W2" offset="4" length="2" endianess="big" rangeMin="0" rangeMax="65535"></value>
+      <value name="CanOut8_W3" offset="6" length="2" endianess="big" rangeMin="0" rangeMax="65535"></value>
+    </frame>
+
+  </frames>
+</RealDashCAN>

@@ -175,7 +175,7 @@ if [[ "$SKIP_ROOTFS" == "false" ]]; then
         sudo rm -rf "$BUILD_DIR/rootfs"
         mkdir -p "$BUILD_DIR/rootfs"
         sudo debootstrap --arch=arm64 --variant=minbase \
-            --include=labwc,seatd,libseat1,busybox,kmod,udev,fish,systemd,systemd-sysv,systemd-timesyncd,fake-hwclock,dbus,libgl1-mesa-dri,mesa-vulkan-drivers,libwayland-client0,libwayland-server0,libegl1,libgles2,libicu76,iproute2,iputils-ping,nano,openssh-server,wget,gnupg,systemd-resolved,can-utils,firmware-brcm80211,wireless-regdb,iw,wpasupplicant,xserver-xorg-core,xserver-xorg,xinit,xauth,xserver-xorg-input-libinput,x11-xserver-utils,x11-utils,xinput,unclutter,zenity \
+            --include=labwc,seatd,libseat1,busybox,kmod,udev,fish,systemd,systemd-sysv,systemd-timesyncd,fake-hwclock,dbus,libgl1-mesa-dri,mesa-vulkan-drivers,libwayland-client0,libwayland-server0,libegl1,libgles2,libicu76,iproute2,iputils-ping,nano,openssh-server,wget,gnupg,systemd-resolved,can-utils,firmware-brcm80211,wireless-regdb,iw,wpasupplicant,xserver-xorg-core,xserver-xorg,xinit,xauth,xserver-xorg-input-libinput,x11-xserver-utils,x11-utils,xinput,zenity \
             trixie "$BUILD_DIR/rootfs" http://deb.debian.org/debian
     else
         echo "RootFS already exists, skipping debootstrap (delete rootfs dir to rebuild)"
@@ -220,7 +220,7 @@ sudo chroot "$ROOTFS" /bin/bash -c "export DEBIAN_FRONTEND=noninteractive; apt-g
 sudo chroot "$ROOTFS" /bin/bash -c "export DEBIAN_FRONTEND=noninteractive; apt-get install -y -o Acquire::AllowInsecureRepositories=true -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold rpi-eeprom raspi-config" 2>&1 || echo "Warning: Could not install rpi-eeprom/raspi-config (may need manual install after boot)"
 
 # Ensure Xorg launcher pieces exist (some images end up missing xinit even if Xorg is present)
-sudo chroot "$ROOTFS" /bin/bash -c "export DEBIAN_FRONTEND=noninteractive; apt-get install -y xinit x11-xserver-utils xinput unclutter zenity" 2>&1 || echo "Warning: Could not install xinit/xinput/zenity (may need manual install after boot)"
+sudo chroot "$ROOTFS" /bin/bash -c "export DEBIAN_FRONTEND=noninteractive; apt-get install -y xinit x11-xserver-utils xinput zenity" 2>&1 || echo "Warning: Could not install xinit/xinput/zenity (may need manual install after boot)"
 
 # WiFi: brcmfmac firmware + wpa_supplicant (from Debian non-free-firmware / main)
 # Drivers ship with the kernel; without firmware-brcm80211, wlan0 never appears.
@@ -368,6 +368,41 @@ WantedBy=multi-user.target
 EOF
 # Enabled but needs calibration for useful mapping; start after: auto-brightness setup
 sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable auto-brightness.service" 2>/dev/null || true
+
+# EpicEFI SocketCAN: bring up can0 for RealDash listen-only (verbose CAN + CAN Outputs).
+# See realdash_scripts/epic-can/README.md — do NOT use systemd-networkd Kind=can on this image.
+echo "=== 7b.2 Installing can0-up + EpicEFI RealDash CAN XML ==="
+EPIC_CAN_DIR="$SCRIPT_DIR/epic-can"
+if [[ ! -f "$EPIC_CAN_DIR/can0-up.sh" || ! -f "$EPIC_CAN_DIR/can0-up.service" ]]; then
+  echo "ERROR: missing $EPIC_CAN_DIR/can0-up.sh or can0-up.service"
+  exit 1
+fi
+# can-utils is also in debootstrap --include; reinstall here is harmless
+sudo chroot "$ROOTFS" /bin/bash -c "export DEBIAN_FRONTEND=noninteractive; apt-get install -y can-utils" 2>&1 \
+  || echo "Warning: Could not install can-utils (may need manual install after boot)"
+sudo install -m 755 "$EPIC_CAN_DIR/can0-up.sh" "$ROOTFS/usr/local/sbin/can0-up.sh"
+sudo install -m 644 "$EPIC_CAN_DIR/can0-up.service" "$ROOTFS/etc/systemd/system/can0-up.service"
+# Strip CRLF if assets were edited on Windows / checked out with CRLF
+sudo sed -i 's/\r$//' "$ROOTFS/usr/local/sbin/can0-up.sh" \
+  "$ROOTFS/etc/systemd/system/can0-up.service"
+sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable can0-up.service" 2>/dev/null || true
+
+# RealDash channel description (verbose 512..523 + custom CAN Outputs 0x500..0x507)
+if [[ -f "$EPIC_CAN_DIR/epicefi_verbose_can.xml" ]]; then
+  sudo mkdir -p \
+    "$ROOTFS/root/Documents/RealDash/settings" \
+    "$ROOTFS/root/.local/share/realdash"
+  sudo install -m 644 "$EPIC_CAN_DIR/epicefi_verbose_can.xml" \
+    "$ROOTFS/root/Documents/RealDash/settings/epicefi_verbose_can.xml"
+  sudo install -m 644 "$EPIC_CAN_DIR/epicefi_verbose_can.xml" \
+    "$ROOTFS/root/.local/share/realdash/epicefi_verbose_can.xml"
+  sudo sed -i 's/\r$//' \
+    "$ROOTFS/root/Documents/RealDash/settings/epicefi_verbose_can.xml" \
+    "$ROOTFS/root/.local/share/realdash/epicefi_verbose_can.xml"
+  echo "Installed epicefi_verbose_can.xml into RealDash settings paths"
+else
+  echo "Warning: $EPIC_CAN_DIR/epicefi_verbose_can.xml missing — skip XML bake-in"
+fi
 
 # Blacklist Bluetooth only (WiFi stays enabled; BT still off via dtoverlay=disable-bt)
 sudo mkdir -p "$ROOTFS/etc/modprobe.d"
@@ -640,10 +675,8 @@ if command -v xset >/dev/null 2>&1; then
   xset m 0 0
 fi
 
-if command -v unclutter >/dev/null 2>&1; then
-  export DISPLAY=:0
-  unclutter -idle 5 -root &
-fi
+# Do not start classic unclutter: it grabs the pointer while the cursor is
+# hidden, so a tap does nothing until you drag. RealDash needs tap-to-click.
 
 xrandr --output ${DSI_CONNECTOR} --mode 720x1920 --rotate ${XRANDR_ROTATE} --primary
 
@@ -668,7 +701,9 @@ EOF
 Description=RealDash (Xorg on tty1)
 After=systemd-user-sessions.service
 After=realdash-kmsdev.service
+After=can0-up.service
 Wants=realdash-kmsdev.service
+Wants=can0-up.service
 Conflicts=getty@tty1.service
 
 [Service]
@@ -689,6 +724,13 @@ RestartSec=0.5
 
 [Install]
 WantedBy=multi-user.target
+EOF
+    # Drop-in keeps ordering even if realdash.service is edited later
+    sudo mkdir -p "$ROOTFS/etc/systemd/system/realdash.service.d"
+    sudo tee "$ROOTFS/etc/systemd/system/realdash.service.d/can0.conf" > /dev/null << 'EOF'
+[Unit]
+After=can0-up.service
+Wants=can0-up.service
 EOF
     sudo chroot "$ROOTFS" /bin/bash -c "systemctl enable realdash.service" 2>/dev/null || true
 fi

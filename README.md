@@ -10,6 +10,8 @@ The images are built from kernel up for specific hardware. It is imperative that
 
 MIPI-DSI or HDMI display fitting your application. See [Adding your own MIPI display](#adding-your-own-mipi-display) below.
 
+**CAN (EpicEFI):** Images ship with MCP2515 dtoverlay, `can0-up.service` (500 kbit/s SocketCAN), and `epicefi_verbose_can.xml` (Verbose 512–523 + custom CAN Outputs `0x500`–`0x507`). Assets under `realdash_scripts/epic-can/`. No userspace get_var bridge.
+
 **USB keyboard and mouse** — required for first-time setup (WiFi, loading dashboards) and for RealDash edit mode. Touch alone is not enough for initial config.
 
 ## install
@@ -384,10 +386,8 @@ if command -v xset >/dev/null 2>&1; then
   xset m 0 0
 fi
 
-if command -v unclutter >/dev/null 2>&1; then
-  export DISPLAY=:0
-  unclutter -idle 5 -root &
-fi
+# Do not start classic unclutter: it grabs the pointer while the cursor is
+# hidden, so a tap does nothing until you drag. RealDash needs tap-to-click.
 
 xrandr --output DSI-2 --mode 720x1920 --rotate left --primary
 
@@ -415,6 +415,7 @@ wait
 5. **`zenity`** is required for RealDash file/open dialogs (`apt-get install -y zenity`). Without it, tinyfiledialogs errors on Unix.
 6. **SSH + live `xinput`** needs `xhost +local:` in `.xinitrc` (and preferably `-auth /root/.Xauthority` on the Xorg line). Fish doesn’t use bash `$(...)` the same way — use `bash -c '...'` for one-liners.
 7. **Kernel cmdline rotation breaks VT switch** with Xorg on the same DSI. Accept portrait tty2 or use SSH for config.
+8. **Classic `unclutter -idle 5 -root`** swallows touch taps until the pointer moves. Do not start it from `.xinitrc`. If you still want a hidden cursor, use `unclutter -idle 5 -root -noevents` (or `unclutter-xfixes`) — not the default grab.
 
 ## Adding your own MIPI display
 

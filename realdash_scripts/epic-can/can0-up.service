@@ -1,0 +1,14 @@
+[Unit]
+Description=Bring up SocketCAN can0 (MCP2515) at 500 kbit/s
+After=systemd-modules-load.service sys-subsystem-net-devices-can0.device
+Wants=sys-subsystem-net-devices-can0.device
+Before=realdash.service graphical.target multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/can0-up.sh
+ExecStop=/sbin/ip link set can0 down
+
+[Install]
+WantedBy=multi-user.target
